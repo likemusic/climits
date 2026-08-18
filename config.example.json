@@ -19,11 +19,10 @@
 
   "accounts": {
     "you@example.com": {
-      "note": "personal subscription — nothing to share, the pace line does the work"
+      "note": "per-account overrides go here; anything omitted falls back to defaults"
     },
     "team@example.com": {
-      "note": "shared counter — see docs/shared-account.md before enabling layer 2",
-      "foreign": {"enabled": true}
+      "note": "a shared counter needs no special setting: the pace line paces the counter itself"
     }
   }
 }

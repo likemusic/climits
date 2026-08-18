@@ -1,9 +1,11 @@
 # Layer 2: shared accounts
 
-**Status: optional, disabled by default, unfinished.** It works and it has been
-used in production against a real shared account, but it is the least settled part
-of climits and it is parked here rather than promoted. Read this before turning it
-on.
+**Status: an experiment, disabled by default, unfinished — not a feature.** It runs,
+and it has been exercised against a real shared account, but the thing it reports is
+an extrapolation of something only indirectly observable. It is documented here
+rather than advertised in the README on purpose. Read all of this before turning it
+on, and treat the number it produces as a hypothesis, not a measurement of anybody's
+usage.
 
 ## The problem
 

@@ -139,7 +139,7 @@ dependencies outside the Python standard library.
 | `climits agents [--hours N]` | exact token spend of finished subagents, by agent type |
 | `climits feed` | status line bridge (reads the payload on stdin) |
 | `climits gate [--enforce]` | the hook entry point |
-| `climits speed` | optional layer 2, see below |
+| `climits speed` | output of the shared-account experiment, off unless enabled |
 
 ## Configuration
 
@@ -173,20 +173,25 @@ auto`); elsewhere it shows up as an informational `~` row and does not stop
 anything. `always` restores blunt behaviour, `never` ignores those windows
 entirely.
 
-### Shared accounts (optional layer 2)
+### Shared accounts
 
-On an account whose counter is fed by several people, your percentages include
-their spend and a threshold stops everybody at once. `lib/foreign.py` estimates the
-other people's rate from the intervals in which *you* made no move, and reserves
-their forecast by trimming your cap.
+On an account several people log into, the counter is common: your percentages
+include everybody's spend. The pace line still does the useful half of the job —
+it paces *the counter*, which is the shared resource, and a counter that is spent
+evenly survives to the end of the week. No attribution is needed for that, and
+none is attempted.
 
-It is **disabled by default and shipped as a separate module** — it only makes
-sense on a shared account, and it is the least settled part of the tool. Enable
-with `{"foreign": {"enabled": true}}`; inspect what it measured with
-`climits speed`. Read [docs/shared-account.md](docs/shared-account.md) first: the
-estimate is deliberately biased and there is a list of what it cannot do.
+There is also an experiment in the tree, `lib/foreign.py`, which tries to estimate
+how fast *other people* are spending and to reserve their share. **Do not treat it
+as a feature.** What it can actually observe is the counter growing while this
+machine was idle; turning that into a per-person rate is an extrapolation, biased
+upward by construction, and it cannot tell one colleague from another or from your
+own second machine. It is disabled by default, it is not loaded unless you switch
+it on, and deleting the file changes nothing else.
 
-Delete `lib/foreign.py` and everything else keeps working.
+If you want to know exactly what it does and does not do before touching it, that
+is written down in [docs/shared-account.md](docs/shared-account.md) — including the
+list of what remains unfinished.
 
 ## Development
 
