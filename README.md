@@ -204,6 +204,8 @@ temporary one, the account comes from an environment variable, and snapshots,
 history and transcripts are built by hand. Anything that changes the line, the gate
 policy, the access states or the shared-account layer should show up here.
 
+Releasing, installing across profiles, and the traps that `claude plugin validate` does not catch: [docs/maintenance.md](docs/maintenance.md).
+
 ## Requirements
 
 Python 3.9+ (standard library only), the `claude` CLI on `PATH`, and a Claude
