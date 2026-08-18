@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "defaults": {
+    "enforce": false,
+
+    "burst_minutes": {"five_hour": 30, "seven_day": 960},
+    "soft_margin_minutes": {"five_hour": 30, "seven_day": 120},
+    "reserve_percent": {"interactive": 5.0, "headless": 5.0},
+
+    "max_wait_seconds": {"interactive": 60, "headless": 300},
+    "ask_cooldown_minutes": 30,
+    "warn_cooldown_minutes": 5,
+
+    "scoped_windows": "auto",
+    "poll_ttl_seconds": 300,
+
+    "foreign": {"enabled": false}
+  },
+
+  "accounts": {
+    "you@example.com": {
+      "note": "personal subscription — nothing to share, the pace line does the work"
+    },
+    "team@example.com": {
+      "note": "shared counter — see docs/shared-account.md before enabling layer 2",
+      "foreign": {"enabled": true}
+    }
+  }
+}

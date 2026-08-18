@@ -1,0 +1,1905 @@
+#!/usr/bin/env python3
+"""climits — a pace governor for Claude Code subscription limits.
+
+Reads how much of each subscription window you have spent and compares it with a
+*pace line*: how much you would be allowed to have spent by this minute if you
+spread the quota evenly over the window. Wired into hooks, it makes the session
+wait (or asks, or declines) *before* the quota runs out, instead of letting you
+hit the wall mid-task.
+
+Subcommands:
+  status [--json]   spend in units of your own quota (default subcommand)
+  status --all      summary across every account on this machine
+  probe  [--force]  refresh the snapshot via GET /api/oauth/usage
+  feed              statusLine bridge: reads stdin, updates snapshot, prints a line
+  agents [--json] [--hours N]  subagent spend: exact tokens from their transcripts
+  gate   [--enforce]  decision for hooks (dry-run unless enforced)
+  speed  [--json]   optional layer 2: measured spend of OTHER people on a shared
+                    account (only when lib/foreign.py is installed and enabled)
+
+It never blocks Claude Code by itself and never mutates Claude Code state: it only
+reads, and writes its own files under ~/.claude/state/limits/.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+VERSION = "0.1.0"
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+DEFAULTS = {
+    # Hooks only observe and log until this is switched on. Off by default on
+    # purpose: a freshly installed plugin must not start pausing anybody's work.
+    "enforce": False,
+    "share": 1.0,
+    # Share of the NOMINAL pace we claim for ourselves. 1.0 — track the line;
+    # 0.7 — spend slower than nominal in the first half of the window and catch up
+    # later. This is the SHAPE of the line, not a cap: whatever k is, the line still
+    # reaches 100% at the reset, so the tail of the window is always usable and no
+    # wall appears at the end of the period (see `_line_pp`).
+    "pace_factor": {"interactive": 1.0, "headless": 1.0},
+    # Insurance for finishing what was started: the last percents are left alone.
+    "reserve_percent": {"interactive": 5.0, "headless": 5.0},
+    # Head start above the line. Without it the beginning of a window is a wall
+    # (a 5h window starts with your first message, and 0% is allowed so far).
+    # A number applies to every window, an object keys it by window name.
+    "burst_pp": {"five_hour": 25.0, "seven_day": 5.0},
+    # How far ahead of the line the warning starts, expressed in TIME: "less than
+    # N minutes of slack left". In percentage points a threshold is not comparable
+    # across windows (the 7d line is 33x flatter), hence minutes. `soft_margin_pp`
+    # is still honoured, but only when set explicitly — it overrides the minutes.
+    "soft_margin_minutes": {"five_hour": 30, "seven_day": 120},
+    # Per-model weekly windows (`weekly_scoped` in the API response, `weekly_<model>`
+    # here) constrain ONLY their own model: with the weekly limit of one model
+    # exhausted you can keep working on another one as if nothing happened. So by
+    # default such a window only gates the session that answers with that model.
+    #   auto   — gates only if the window's model was seen in this session (default)
+    #   always — always gates
+    #   never  — never gates, stays an informational row in `status`
+    "scoped_windows": "auto",
+    # How long a model counts as "in use" after its last reply. Needed for `status`
+    # and the statusline, which have no session of their own: there we take the
+    # models of every session on the machine within this span.
+    "model_seen_ttl_minutes": 60,
+    "ask_cooldown_minutes": 30,  # or the question would pop up on every Bash/Task
+    # Same for warnings. Became necessary once the hook matcher was widened from
+    # "Task|Bash" to "*" (otherwise the gate cannot see the tools subagents run):
+    # without muting, the "climits ..." line would print on every single Read.
+    "warn_cooldown_minutes": 5,
+    # A short overrun is cured by waiting: the hook sleeps until the pace line
+    # catches up with the spend and then lets the call through. A human is only
+    # worth interrupting when the wait would be long.
+    "max_wait_seconds": {"interactive": 60, "headless": 300},
+    "poll_ttl_seconds": 300,
+    # A snapshot older than this is not "slightly stale", it is untrustworthy: a
+    # five-hour window turns over completely by then, and printing its percentages
+    # as current would be a lie.
+    "stale_after_seconds": 1800,
+    "on_soft": "warn",
+    "on_exceed": "ask",
+    "on_exceed_headless": "deny",   # never end the session, only decline the call
+    "safety": 0.85,
+    # Layer 2 — pace control on a SHARED account, where the counter is fed by
+    # several people. Shipped as an optional module (lib/foreign.py) and disabled
+    # by default; see docs/shared-account.md.
+    "foreign": {"enabled": False},
+}
+# `kind` from limits[] -> our window name
+KIND_TO_WINDOW = {"session": "five_hour", "weekly_all": "seven_day"}
+# Window length is what turns `resets_at` into "how much of it has already passed":
+# the API only reports the reset moment, while "how much is due by now" is measured
+# from the start.
+WINDOW_SECONDS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
+DEFAULT_WINDOW_SECONDS = 7 * 86400          # per-model weekly windows
+
+
+def config_dir() -> str:
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+
+def state_dir() -> str:
+    """State lives ONCE PER MACHINE (`~/.claude/state/limits`), not per config dir.
+
+    Profiles (`~/.claude/profiles/*`) have their own config dir, and splitting the
+    state along with them would make layer 2 read our own activity from a
+    neighbouring profile as somebody else's. Files are keyed by a hash of the
+    account, so different accounts never collide."""
+    path = (os.environ.get("CLIMITS_STATE_DIR")
+            or os.path.join(os.path.expanduser("~/.claude"), "state", "limits"))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def plugin_root() -> str:
+    """Repository/plugin root — one level above bin/."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+_FOREIGN_CACHE: list = []
+
+
+def foreign_module():
+    """Layer 2, loaded lazily from lib/foreign.py; None when it is not installed.
+
+    Deliberately optional: measuring other people's spend only makes sense on a
+    shared account, and the heuristic behind it is the least settled part of the
+    tool. Delete the file and everything else keeps working."""
+    if _FOREIGN_CACHE:
+        return _FOREIGN_CACHE[0]
+    path = os.environ.get("CLIMITS_FOREIGN") or os.path.join(plugin_root(), "lib",
+                                                             "foreign.py")
+    module = None
+    if os.path.exists(path):
+        try:
+            spec = importlib.util.spec_from_file_location("climits_foreign", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception:                   # a broken add-on must not break the core
+            module = None
+    _FOREIGN_CACHE.append(module)
+    return module
+
+
+def budget_path() -> str | None:
+    """The config is looked up in the current CLAUDE_CONFIG_DIR first, then in
+    ~/.claude. Profiles have their own config dir, but there is a single limits
+    config per machine: without this fallback a profile session would silently
+    drop back to the defaults."""
+    candidates = [os.path.join(config_dir(), "limits-budget.json"),
+                  os.path.expanduser("~/.claude/limits-budget.json")]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def load_budget() -> dict:
+    path = budget_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return {"defaults": dict(DEFAULTS), "accounts": {}, "_missing": True}
+    defaults = dict(DEFAULTS)
+    for key, value in (raw.get("defaults") or {}).items():
+        # Nested settings (`foreign`, `pace_factor`, ...) are merged one level deep:
+        # overriding one key must not throw away the remaining defaults.
+        if isinstance(value, dict) and isinstance(defaults.get(key), dict):
+            merged = dict(defaults[key])
+            merged.update(value)
+            defaults[key] = merged
+        else:
+            defaults[key] = value
+    return {"defaults": defaults, "accounts": raw.get("accounts") or {}}
+
+
+def _email_from_auth_status(stdout: str, stderr: str = "") -> str | None:
+    """Account from `claude auth status --json`. On an account whose subscription
+    has lapsed the JSON carries `email: null` (together with orgId) and the address
+    survives only in the "key <email>" line on stderr — without that fallback the
+    account is "lost" and its state drifts into the shared `unknown` key, mixing
+    with somebody else's."""
+    body = stdout[stdout.find("{"):] if "{" in stdout else ""
+    try:
+        email = (json.loads(body) or {}).get("email")
+    except ValueError:
+        email = None
+    if email:
+        return email
+    found = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", stderr or "")
+    return found.group(0) if found else None
+
+
+def account_email() -> str | None:
+    """The current account. `claude auth status --json` costs ~0.6s, so it is
+    cached; the cache is invalidated by the mtime of .credentials.json, i.e. by a
+    profile switch."""
+    if os.environ.get("CLIMITS_ACCOUNT"):
+        return os.environ["CLIMITS_ACCOUNT"]     # offline run (tests, debugging)
+    creds = os.path.join(config_dir(), ".credentials.json")
+    try:
+        stamp = os.path.getmtime(creds)
+    except OSError:
+        stamp = 0.0
+    cache_path = os.path.join(state_dir(), "account.json")
+    try:
+        with open(cache_path, encoding="utf-8") as fh:
+            cached = json.load(fh)
+        if cached.get("stamp") == stamp and cached.get("email"):
+            return cached["email"]
+    except (OSError, ValueError):
+        pass
+    try:
+        out = subprocess.run(
+            ["claude", "auth", "status", "--json"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # stderr is not noise: the CLI prints the "key <email>" line there, and on an
+    # account with a closed subscription that is the only place the address appears.
+    email = _email_from_auth_status(out.stdout, out.stderr)
+    if email:
+        _atomic_write(cache_path, {"email": email, "stamp": stamp})
+    return email
+
+
+def oauth_credentials() -> dict:
+    """The `claudeAiOauth` block of the current profile: subscription type, tier and
+    token lifetime. This is the CLI cache, not the server: it shows what we
+    authenticate with, but it does NOT know the subscription has been closed. Only
+    the API response can rule on access."""
+    try:
+        with open(os.path.join(config_dir(), ".credentials.json"), encoding="utf-8") as fh:
+            return json.load(fh).get("claudeAiOauth") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def token_expired_at(creds: dict) -> int | None:
+    """When the access token expired (epoch seconds), if it already has. The CLI
+    refreshes the token when a session starts; `claude auth status` does not, so in
+    a profile you have not used for a while the token sits expired and every API
+    request answers 401."""
+    expires = creds.get("expiresAt")
+    if not isinstance(expires, (int, float)):
+        return None
+    at = int(expires / 1000)
+    return at if at < time.time() else None
+
+
+def account_key(email: str | None) -> str:
+    return hashlib.sha256((email or "unknown").encode()).hexdigest()[:16]
+
+
+def snapshot_path(email: str | None) -> str:
+    return os.path.join(state_dir(), f"{account_key(email)}.json")
+
+
+def _atomic_write(path: str, payload: dict) -> None:
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def read_snapshot(email: str | None) -> dict | None:
+    try:
+        with open(snapshot_path(email), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def activity_path(email: str | None) -> str:
+    return os.path.join(state_dir(), f"{account_key(email)}.activity.json")
+
+
+def activity_last(email: str | None) -> int:
+    """When WE last made a move — across every session on the machine at once. The
+    gate hangs on `UserPromptSubmit`, so any move of ours is stamped here BEFORE it
+    spends tokens; telling our load apart from other people's rests on that."""
+    try:
+        with open(activity_path(email), encoding="utf-8") as fh:
+            return int(float(json.load(fh).get("at", 0)))
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def activity_touch(email: str | None, at: float | None = None) -> None:
+    """The stamp records when the call STARTED: the history point is written a
+    fraction of a second later, and in the opposite order the interval after it
+    would look dirty."""
+    _atomic_write(activity_path(email), {"at": int(at if at is not None else time.time())})
+
+
+def history_path(email: str | None) -> str:
+    return os.path.join(state_dir(), f"{account_key(email)}.history.jsonl")
+
+
+def history_append(email: str | None, windows: dict, last_act: int) -> None:
+    """A history point: counter values plus the moment of our last activity (`act`).
+
+    The interval between two points is CLEAN when all of our activity stayed before
+    its start, i.e. the `act` of the second point is no later than the time of the
+    first. Only layer 2 reads this file, but it is written regardless: the raw
+    material has to exist before the add-on can ever be switched on."""
+    path = history_path(email)
+    try:
+        if os.path.getsize(path) > 1_000_000:
+            os.replace(path, f"{path}.1")
+    except OSError:
+        pass
+    record = {"t": int(time.time()), "act": int(last_act or 0),
+              "w": {name: {"u": float(data["used"]), "r": data.get("resets_at")}
+                    for name, data in (windows or {}).items()
+                    if data.get("used") is not None}}
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
+def history_read(email: str | None, max_lines: int = 5000) -> list[dict]:
+    try:
+        with open(history_path(email), encoding="utf-8") as fh:
+            lines = fh.readlines()[-max_lines:]
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or not record.get("t"):
+            continue
+        windows = {}
+        for name, value in (record.get("w") or {}).items():
+            if isinstance(value, dict):
+                if value.get("u") is not None:
+                    windows[name] = (float(value["u"]), value.get("r"))
+            elif value is not None:
+                windows[name] = (float(value), None)    # legacy format: used only
+        # Points without `act` predate activity stamps and were written while we
+        # were working. Treat them as activity at the point itself: the interval
+        # that ENDS with such a point is then excluded from the measurement.
+        act = record.get("act")
+        out.append({"t": int(record["t"]),
+                    "act": int(record["t"]) if act is None else int(act),
+                    "w": windows})
+    out.sort(key=lambda item: item["t"])
+    return out
+
+
+def _thousands(value: float) -> str:
+    """12520 -> "12 520": tokens read in thousands, and a comma fights the text."""
+    return f"{value:,.0f}".replace(",", " ")
+
+
+def agents_path(email: str | None) -> str:
+    return os.path.join(state_dir(), f"{account_key(email)}.agents.jsonl")
+
+
+def agent_usage_from_transcript(path: str) -> dict:
+    """Exact spend of a subagent, taken from its own transcript.
+
+    The path arrives in the `SubagentStop` payload as `agent_transcript_path` —
+    the only place where a subagent's spend is a number rather than a guess.
+
+    One model message sits in the file as SEVERAL records (intermediate stream
+    snapshots plus the final one) sharing a `message.id`, so summing line by line
+    would inflate the spend threefold. Take one record per id — the one with the
+    larger `output_tokens`, which is the final one."""
+    best: dict[str, dict] = {}
+    models: set[str] = set()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict) or record.get("type") != "assistant":
+                    continue
+                if record.get("isApiErrorMessage"):
+                    continue
+                message = record.get("message") or {}
+                usage = message.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                key = str(message.get("id") or record.get("uuid") or len(best))
+                prev = best.get(key)
+                if prev is None or (int(usage.get("output_tokens") or 0)
+                                    > int(prev.get("output_tokens") or 0)):
+                    best[key] = usage
+                if message.get("model"):
+                    models.add(str(message["model"]))
+    except OSError:
+        return {}
+    totals = {"messages": len(best), "input": 0, "output": 0,
+              "cache_creation": 0, "cache_read": 0, "models": sorted(models)}
+    for usage in best.values():
+        totals["input"] += int(usage.get("input_tokens") or 0)
+        totals["output"] += int(usage.get("output_tokens") or 0)
+        totals["cache_creation"] += int(usage.get("cache_creation_input_tokens") or 0)
+        totals["cache_read"] += int(usage.get("cache_read_input_tokens") or 0)
+    return totals
+
+
+def agents_append(email: str | None, record: dict) -> None:
+    path = agents_path(email)
+    try:
+        if os.path.getsize(path) > 1_000_000:
+            os.replace(path, f"{path}.1")
+    except OSError:
+        pass
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def agents_read(email: str | None, max_lines: int = 5000) -> list[dict]:
+    """Records of finished subagents, one per agent. Deduplication is needed because
+    `SubagentStop` can fire twice (for an interrupted agent, say): the key is
+    `agent` and the last record wins, being the most complete one."""
+    try:
+        with open(agents_path(email), encoding="utf-8") as fh:
+            lines = fh.readlines()[-max_lines:]
+    except OSError:
+        return []
+    by_agent: dict[str, dict] = {}
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or not record.get("t"):
+            continue
+        by_agent[str(record.get("agent") or record["t"])] = record
+    return sorted(by_agent.values(), key=lambda item: item["t"])
+
+
+def _iso_to_epoch(value) -> int | None:
+    if not isinstance(value, str):
+        return None
+    import datetime
+    try:
+        return int(datetime.datetime.fromisoformat(value).timestamp())
+    except ValueError:
+        return None
+
+
+def windows_from_api(payload: dict) -> dict:
+    """Windows from the /api/oauth/usage response. limits[] is richer than the
+    top-level fields: it carries the per-model weekly windows (weekly_scoped)."""
+    windows: dict[str, dict] = {}
+    for name in ("five_hour", "seven_day"):
+        block = payload.get(name)
+        if isinstance(block, dict) and block.get("utilization") is not None:
+            windows[name] = {
+                "used": float(block["utilization"]),
+                "resets_at": _iso_to_epoch(block.get("resets_at")),
+            }
+    for item in payload.get("limits") or []:
+        if not isinstance(item, dict) or item.get("percent") is None:
+            continue
+        kind = item.get("kind")
+        name = KIND_TO_WINDOW.get(kind)
+        scope_model = None
+        if name is None and kind == "weekly_scoped":
+            model = ((item.get("scope") or {}).get("model") or {}).get("display_name")
+            if not model or not item.get("is_active"):
+                continue                       # an inactive scoped window constrains nothing
+            name = f"weekly_{model.lower()}"
+            scope_model = model
+        if name is None:
+            continue
+        windows[name] = {
+            "used": float(item["percent"]),
+            "resets_at": _iso_to_epoch(item.get("resets_at")),
+            "severity": item.get("severity"),
+        }
+        if scope_model:
+            # The model name is needed later to tell whether this window constrains
+            # the model actually in use; parsing it back out of the window name
+            # would lose case and spaces ("Opus 4.5" -> "weekly_opus 4.5").
+            windows[name]["model"] = scope_model
+    return windows
+
+
+def _model_slug(value: str) -> str:
+    """A model name without separators or case, so that "Fable" and "claude-fable-5"
+    become comparable. The version is left alone — display_name rarely carries one,
+    and a substring hit ("fable" in "claudefable5") already does the job."""
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def model_matches(display_name: str, model_id: str) -> bool:
+    slug = _model_slug(display_name)
+    return bool(slug) and slug in _model_slug(model_id)
+
+
+def transcript_models(path: str, tail_bytes: int = 65536, limit: int = 5) -> list[str]:
+    """Models the assistant replied with at the END of a session transcript.
+
+    The only clue a hook has about "what is being used right now": the event payload
+    does not carry the model, while `message.model` in the transcript does. Only the
+    tail of the file is read — the gate hangs on the `*` matcher and runs on every
+    tool, where parsing a multi-megabyte transcript is out of the question."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > tail_bytes:
+                fh.seek(size - tail_bytes)
+                fh.readline()                  # the first line is cut off — drop it
+            chunk = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    models: list[str] = []
+    for line in reversed(chunk.splitlines()):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("type") != "assistant":
+            continue
+        model = (record.get("message") or {}).get("model")
+        if model and str(model) not in models:
+            models.append(str(model))
+            if len(models) >= limit:
+                break
+    return models
+
+
+def models_path(email: str | None) -> str:
+    return os.path.join(state_dir(), f"{account_key(email)}.models.json")
+
+
+def models_read(email: str | None) -> dict:
+    try:
+        with open(models_path(email), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def models_touch(email: str | None, session: str | None, models: list[str],
+                 ttl_seconds: float = 3600.0) -> None:
+    """Remember what this session answers with. The file is shared per account and
+    serves as a hint where there is no session of our own (`status`, statusline):
+    it shows whether anybody on the machine is using the model whose window is
+    against the limit."""
+    key = str(session or "?")
+    data = models_read(email)
+    now = int(time.time())
+    data[key] = {"at": now, "models": models}
+    data = {name: item for name, item in data.items()
+            if isinstance(item, dict) and now - int(item.get("at") or 0) <= ttl_seconds}
+    _atomic_write(models_path(email), data)
+
+
+def session_models(email: str | None, payload: dict, ttl_seconds: float = 3600.0,
+                   cache_seconds: float = 120.0) -> list[str]:
+    """What THIS session answers with, from its transcript, cached in the shared
+    models file.
+
+    The cache exists because of the `*` matcher: without it the transcript tail
+    would be read on every Read. A `/model` switch is delayed by at most
+    `cache_seconds`."""
+    session = str(payload.get("session_id") or "?")
+    cached = models_read(email).get(session) or {}
+    if cached.get("models") and time.time() - float(cached.get("at") or 0) < cache_seconds:
+        return list(cached["models"])
+    models = transcript_models(payload.get("transcript_path") or "")
+    if models:
+        models_touch(email, session, models, ttl_seconds)
+        return models
+    # No transcript yet (the session just started) — fall back to what we knew
+    return list(cached.get("models") or [])
+
+
+def models_recent(email: str | None, ttl_seconds: float = 3600.0) -> list[str]:
+    """Models of every session on the machine within the last ttl. Empty means
+    "unknown", not "none"."""
+    now = time.time()
+    out: list[str] = []
+    for item in models_read(email).values():
+        if not isinstance(item, dict) or now - float(item.get("at") or 0) > ttl_seconds:
+            continue
+        for model in item.get("models") or []:
+            if str(model) not in out:
+                out.append(str(model))
+    return out
+
+
+# 401/403 codes that show access was closed BY THE ACCOUNT ITSELF (subscription
+# lapsed, or OAuth disallowed by the organization) rather than by a stale login:
+# refreshing the token would not help.
+SUBSCRIPTION_DENIED_CODES = {
+    "oauth_not_allowed_for_organization":
+        "the account has no active subscription (or OAuth is closed by an admin)",
+}
+
+
+def _http_error_cause(exc: "urllib.error.HTTPError", creds: dict) -> tuple[str, str | None]:
+    """Reason in plain words plus the API error code (used to classify the state).
+    Known codes are translated — `oauth_not_allowed_for_organization` is what comes
+    back when the subscription has run out, which is not at all obvious from the
+    wording ("OAuth authentication is currently not allowed for this organization")."""
+    code, message = None, None
+    try:
+        body = json.loads(exc.read().decode("utf-8", "replace"))
+        error = body.get("error") or {}
+        message = error.get("message")
+        code = ((error.get("details") or {}).get("error_code"))
+    except (OSError, ValueError, AttributeError):
+        pass
+    known = SUBSCRIPTION_DENIED_CODES.get(code)
+    parts = [known or message or "no reason given"]
+    if code and known:
+        parts.append(f"API: {code}")
+    expired = token_expired_at(creds)
+    if expired:
+        parts.append("login expired "
+                     f"{time.strftime('%d %b %H:%M', time.localtime(expired))}"
+                     " — it refreshes when claude starts in this profile")
+    return "; ".join(parts), code
+
+
+def probe(email: str | None, force: bool = False, ttl: int = 300,
+          last_act: int | None = None) -> tuple[dict | None, str, str]:
+    """Refresh the snapshot through the API when it is older than the TTL.
+
+    Returns (snapshot, reason, state). The reason is a string for humans and the
+    log, the state is a code for branching and tables: `fresh`/`updated`/`locked`
+    (data confirmed), `no_subscription`/`auth_expired`/`denied` (no access to the
+    quota), `no_token`, `throttled`, `unreachable` (network or unexpected HTTP).
+    Nobody has to parse the reason string."""
+    # The TTL counts from the last PULL rather than from any update: otherwise a
+    # push from `feed` would postpone the API poll forever, and only the poll
+    # brings the full picture.
+    snap = read_snapshot(email)
+    if not force and snap and time.time() - snap.get("apiFetchedAt", 0) < ttl:
+        return snap, "fresh", "fresh"
+
+    lock_path = os.path.join(state_dir(), f"{account_key(email)}.lock")
+    with open(lock_path, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # nothing to wait for: the snapshot is shared
+            return snap, "another session is refreshing it", "locked"
+        # Somebody may have refreshed it while we waited for the lock
+        snap = read_snapshot(email)
+        if not force and snap and time.time() - snap.get("apiFetchedAt", 0) < ttl:
+            return snap, "fresh", "fresh"
+        creds = oauth_credentials()
+        token = creds.get("accessToken")
+        if not token:
+            return snap, "no OAuth token", "no_token"
+        req = urllib.request.Request(
+            USAGE_URL,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.load(resp)
+        except urllib.error.HTTPError as exc:
+            # 401/403 is the only signal that access to the quota is gone: either the
+            # subscription ended OR the login went stale. The API names the reason in
+            # the response body (`oauth_not_allowed_for_organization` = closed
+            # subscription), which beats any guess based on the token lifetime; the
+            # lifetime is only added as a hint. The two cases are cured differently
+            # ("pay" vs "start claude in that profile"), hence two distinct states
+            # rather than one shared "no access".
+            if exc.code in (401, 403):
+                cause, code = _http_error_cause(exc, creds)
+                state = ("no_subscription" if code in SUBSCRIPTION_DENIED_CODES
+                         else "auth_expired" if token_expired_at(creds)
+                         else "denied")
+                return snap, f"no access ({exc.code}): {cause}", state
+            # 429 is a rate limit on `/oauth/usage` itself, not subscription spend:
+            # it shows up under frequent `probe --force` and is cured by waiting,
+            # not by logging in or paying.
+            if exc.code == 429:
+                return snap, "poll failed: HTTP 429 (too often)", "throttled"
+            return snap, f"poll failed: HTTP {exc.code}", "unreachable"
+        except (urllib.error.URLError, ValueError, TimeoutError) as exc:
+            # The CLI refreshes an expired token itself — we stay out of it and
+            # degrade to the previous snapshot.
+            return snap, f"poll failed: {exc}", "unreachable"
+        now = int(time.time())
+        windows = windows_from_api(payload)
+        for window in windows.values():
+            window["updated_at"] = now
+        fresh = {
+            "account": email,
+            "fetchedAt": now,
+            "apiFetchedAt": now,
+            "source": "api",
+            "windows": windows,
+        }
+        _atomic_write(snapshot_path(email), fresh)
+        # History point for layer 2. It is the pull that writes it: the pull runs on
+        # a TTL (every five minutes while working) and is shared by all sessions, so
+        # the points land evenly and an idle stretch between sessions turns into one
+        # long clean interval — which is what the measurement rests on.
+        history_append(email, windows,
+                       activity_last(email) if last_act is None else last_act)
+        return fresh, "updated", "updated"
+
+
+def settings_for(budget: dict, email: str | None) -> dict:
+    """Settings of an account: defaults with the account's own values on top, so a
+    shared work account can get its own cap without touching the personal one."""
+    merged = dict(budget["defaults"])
+    account = (budget["accounts"] or {}).get(email or "", {})
+    for key, value in account.items():
+        if key in ("share", "windows", "note"):
+            continue
+        # nested blocks are merged just like in load_budget: a partial override must
+        # not throw away the remaining defaults
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    return merged
+
+
+def share_for(budget: dict, email: str | None, window: str) -> float:
+    account = (budget["accounts"] or {}).get(email or "", {})
+    per_window = (account.get("windows") or {}).get(window)
+    if per_window is not None:
+        return float(per_window)
+    return float(account.get("share", budget["defaults"]["share"]))
+
+
+def by_key(value, key: str, fallback: float) -> float:
+    """A setting is either one number for every case or an object keyed by name."""
+    if isinstance(value, dict):
+        return float(value.get(key, fallback))
+    return float(value) if value is not None else fallback
+
+
+_by_key = by_key      # short alias used throughout the file
+
+
+def _line_pp(frac: float, burst: float, pace: float) -> float:
+    """The pace line in percentage points at fraction `frac` of the window elapsed.
+
+    The slope is NOT constant: it grows linearly from `pace` x nominal at the start
+    of the window to (2 - `pace`) x nominal at its end, so the line equals
+    `burst + 100*(k*f + (1-k)*f^2)`. At pace = 1 this is exactly the plain "as much
+    of the window as has passed, that much quota is allowed"; at pace < 1 it is the
+    same line bent down in the first half and catching up in the second. Either way
+    it reaches 100% at the reset.
+
+    That shape fixes two flaws of the earlier form `pace*elapsed% + burst`. First,
+    it ended at `pace*100%`, and the band between that value and the cap was
+    unreachable FOREVER — at pace = 0.9 the line stopped at 91.2%, so a spend of 92%
+    (still below the 95% cap) was reported as "the line will never catch up".
+    Second, the concession was spread evenly, whereas its place is the beginning of
+    the window: holding back in the tail buys nothing, since unspent quota burns at
+    the reset anyway.
+
+    pace > 1 (claiming more than nominal) has no shape: the line would run above
+    100% and hit the cap regardless, so such a value is clamped to 1."""
+    pace = min(pace, 1.0)
+    frac = max(frac, 0.0)
+    return burst + 100.0 * (pace * frac + (1.0 - pace) * frac * frac)
+
+
+def _line_seconds_at(pp: float, burst: float, pace: float, total: int) -> float:
+    """Inverse of `_line_pp`: at which second of the window the line reaches `pp`.
+    Solved exactly (root of the quadratic) rather than by dividing by "the speed of
+    the line" — that speed is not constant. Below `burst` the line is continued
+    backwards at the nominal slope, otherwise the head start would collapse to zero
+    in the first minutes of a window for no reason."""
+    pace = min(pace, 1.0)
+    x = (pp - burst) / 100.0
+    if x <= 0:
+        return x * total
+    tail = 1.0 - pace
+    if tail < 1e-12:
+        return total * x
+    return total * (-pace + (pace * pace + 4.0 * tail * x) ** 0.5) / (2.0 * tail)
+
+
+def _catch_up_seconds(own: float, burst: float, pace: float, total: int, cap: float,
+                      reserve_rate: float, elapsed_seconds: float,
+                      seconds_left: int | None) -> tuple[int | None, bool]:
+    """How long until the allowance catches up with the spend — and whether it can.
+
+    There are two constraints and they grow differently: the pace line follows its
+    own curve (inverted exactly above), while the cap rises as the forecast of other
+    people's spend until the reset shrinks. We must wait for the slower one, but
+    never longer than the reset itself, which zeroes the counter. The second element
+    of the answer says whether this is possible at all, and there is exactly one way
+    it is not: the spend is above the window CAP (the reserve for finishing plus
+    other people's share). Anything below the cap is caught up WITHIN the window for
+    sure — the line reaches 100% by the reset."""
+    if seconds_left is None:
+        return None, True
+    wait = max(0.0, _line_seconds_at(own, burst, pace, total) - elapsed_seconds)
+    if own > cap:
+        if reserve_rate <= 0:
+            return int(seconds_left), False     # only the reset can help
+        wait = max(wait, (own - cap) / reserve_rate)
+    if wait >= seconds_left:
+        return int(seconds_left), False
+    return int(wait), True
+
+
+def evaluate(snap: dict | None, budget: dict, email: str | None,
+             headless: bool = False, models: list[str] | None = None) -> dict:
+    """Convert spend into units of OUR OWN quota. The tightest window rules.
+
+    `models` are the models in use right now (from the session transcript). They
+    decide whether a per-model window gates: a weekly limit on one model does not
+    stand in the way of working on another, and a gate tripping over somebody
+    else's model is a false alarm."""
+    defaults = settings_for(budget, email)
+    mode = "headless" if headless else "interactive"
+    ceiling = 100.0 - _by_key(defaults.get("reserve_percent"), mode, 5.0)
+    pace = _by_key(defaults.get("pace_factor"), mode, 1.0)
+    foreign_cfg = defaults.get("foreign") or {}
+    foreign = foreign_module() if foreign_cfg.get("enabled") else None
+    history = history_read(email) if foreign else []
+    scoped_policy = str(defaults.get("scoped_windows", "auto"))
+    now = time.time()
+    rows = []
+    for name, data in sorted((snap or {}).get("windows", {}).items()):
+        share = share_for(budget, email, name)
+        used = float(data.get("used", 0.0))
+        own = used / share if share > 0 else float("inf")
+        resets_at = data.get("resets_at")
+        seconds_left = int(resets_at - now) if resets_at else None
+
+        # The pace line: as much of the window as has passed, that much quota is
+        # allowed. Plus burst, or the start of a window would allow about 0% and the
+        # very first request would hit a wall; burst also legalises a burst of spend
+        # after an idle stretch. The cap is the quota minus the reserve.
+        total = WINDOW_SECONDS.get(name, DEFAULT_WINDOW_SECONDS)
+        # The head start can be given in percentage points (burst_pp) or in time
+        # (burst_minutes — "as much as the line grows in N minutes"); the latter
+        # automatically yields different percentages for different windows.
+        if defaults.get("burst_minutes") is not None:
+            burst = _by_key(defaults["burst_minutes"], name, 10.0) * 60 / total * 100
+        else:
+            burst = _by_key(defaults.get("burst_pp"), name, 5.0)
+        # Layer 2, when installed: measured load of other people on a shared account.
+        # Their forecast until the reset is reserved for them by trimming our CAP,
+        # not the slope of the line. Trimming the slope would be wrong: it applies to
+        # the whole elapsed window, so colleagues appearing now would retroactively
+        # take away what we already spent. The cap only touches the unspent part.
+        measure = foreign.measure(history, name, foreign_cfg, now) if (foreign and history) else None
+        pace_row = 1.0 if (measure and foreign_cfg.get("override_pace", True)) else pace
+        reserve = 0.0
+        reserve_rate = 0.0
+        if measure and seconds_left:
+            reserve, reserve_rate = foreign.reserve(measure, foreign_cfg, mode,
+                                                    ceiling, own, seconds_left)
+        cap = ceiling - reserve
+
+        if seconds_left is None:
+            elapsed_pct = elapsed_seconds = None
+            line = cap
+        else:
+            elapsed_seconds = min(max(total - seconds_left, 0), total)
+            elapsed_pct = elapsed_seconds / total * 100.0
+            line = _line_pp(elapsed_seconds / total, burst, pace_row)
+        allowed = max(0.0, min(line, cap))
+        # The nominal rate is 100% of the quota per window. Time thresholds are
+        # converted into points against IT, not against the momentary speed of the
+        # line: that speed varies (below nominal early in the window, above it in the
+        # tail), and a threshold based on it would change several-fold within one
+        # window.
+        norm_rate = 100.0 / total                       # pp per second
+
+        # The warning threshold. In percentage points it does not carry across
+        # windows: their lines differ in steepness (20 pp/h for five_hour against
+        # 0.595 for seven_day, a factor of 33), so one number means "half an hour of
+        # slack" here and "almost a day" there — on the weekly window "!" was lit
+        # essentially always. Hence the threshold is given in TIME (like
+        # burst_minutes) and converted into points at the NOMINAL rate of the window.
+        # soft_margin_pp remains available as an explicit override in points.
+        if defaults.get("soft_margin_pp") is not None:
+            margin = _by_key(defaults["soft_margin_pp"], name, 10.0)
+        else:
+            margin = (_by_key(defaults.get("soft_margin_minutes"), name, 30.0)
+                      * 60 * norm_rate)
+
+        # The same gap as headroom, but in units of TIME and in both directions: how
+        # much is left before the line (slack, "+") or how long the line will need to
+        # catch up with the spend (debt, "-"). It is computed by inverting the line —
+        # "we are where the norm was N ago" and "the norm will be here in N"; the
+        # overrun comes from wait_seconds, where both constraints are accounted for.
+        wait, reachable = _catch_up_seconds(own, burst, pace_row, total, cap,
+                                            reserve_rate, elapsed_seconds, seconds_left)
+        if seconds_left is None:
+            slack = None
+        elif own <= allowed:
+            # Slack is where we stand relative to the point at which the line equals
+            # our spend. The second term matters when the allowance is bounded by the
+            # cap rather than the line: there the line adds nothing more, and the
+            # margin is measured up to the cap.
+            by_line = elapsed_seconds - _line_seconds_at(own, burst, pace_row, total)
+            slack = int(min(by_line, (allowed - own) / norm_rate))
+        else:
+            slack = -wait if wait is not None else None
+
+        # Does this window gate our work? A per-model one does only while its model
+        # is the one answering: otherwise a weekly limit exhausted on one model would
+        # stop a session running on another, where that quota is not spent at all.
+        scope_model = data.get("model")
+        if not scope_model and name.startswith("weekly_") and name not in WINDOW_SECONDS:
+            # Snapshots taken before the `model` field existed only know the window
+            # name. Case is lost there, but slug comparison does not care.
+            scope_model = name[len("weekly_"):]
+        gates, scope_note = True, None
+        if scope_model:
+            if scoped_policy == "always":
+                scope_note = "always gates (scoped_windows=always)"
+            elif scoped_policy == "never":
+                gates, scope_note = False, "disabled in config (scoped_windows=never)"
+            elif not models:
+                gates = False
+                scope_note = "session model unknown"
+            elif any(model_matches(scope_model, m) for m in models):
+                scope_note = f"model {scope_model} in use"
+            else:
+                gates = False
+                scope_note = (f"model {scope_model} not in use "
+                              f"(currently {', '.join(models)})")
+
+        rows.append({
+            "window": name,
+            "scope_model": scope_model,     # None for shared windows, model name for scoped
+            "gates": gates,                 # False — the window is shown but does not gate
+            "scope_note": scope_note,
+            "share": share,
+            "used_plan": used,
+            "used_own": own,
+            "elapsed_pct": elapsed_pct,     # how much of the window has passed
+            "burst_pp": burst,
+            "pace_factor": pace_row,
+            "pace_source": "measured" if pace_row != pace else "config",
+            "foreign_pph": measure["rate_pph"] if measure else None,
+            "foreign_measure": measure,
+            "foreign_reserve_pp": reserve,
+            "cap_own": cap,                 # cap including the reserve for others
+            "allowed_own": allowed,         # own quota allowed by this minute
+            "soft_margin_pp": margin,       # warning threshold in points of this window
+            # the same threshold in time — the unit in which windows are comparable
+            "soft_margin_seconds": int(margin / norm_rate),
+            "headroom": allowed - own,      # <0 — spent more than time has passed
+            # how long until the allowance catches up (assuming we spend nothing)
+            "wait_seconds": wait,
+            # Whether the allowance catches up within the window. False — the spend is
+            # above the cap and waiting is pointless: only the reset clears it.
+            "catch_up_possible": reachable,
+            "slack_seconds": slack,         # the same gap in time: + slack, - debt
+            "resets_at": resets_at,
+            "seconds_left": seconds_left,
+            "verdict": ("exceed" if own >= allowed else
+                        "soft" if own >= allowed - margin else "ok"),
+        })
+    if not rows:
+        return {"verdict": "unknown", "windows": [], "tightest": None, "problems": []}
+    gating = [r for r in rows if r["gates"]]
+    if not gating:
+        return {"verdict": "ok", "windows": rows, "tightest": None, "problems": []}
+    # The tightest window is the one with the least free room before the line, and it
+    # has to be measured in TIME rather than points: window lines differ in steepness
+    # by a factor of 33, so "+15 pp" is 46 minutes of slack on the five-hour window
+    # against more than a day on the weekly one. By points the wrong window regularly
+    # came out as the tightest.
+    tightest = min(gating, key=_tight_key)
+    order = {"ok": 0, "soft": 1, "exceed": 2}
+    verdict = max((r["verdict"] for r in gating), key=lambda v: order[v])
+    # Every window with a problem, not just the tightest: while only one was reported,
+    # the second (and real) one hid quietly behind it.
+    problems = sorted((r for r in gating if r["verdict"] != "ok"), key=_tight_key)
+    return {"verdict": verdict, "windows": rows, "tightest": tightest,
+            "problems": problems}
+
+
+def _tight_key(row: dict) -> float:
+    """How tight a window is, in TIME: + slack, - debt. When the line is standing
+    still (no slack to compute), sort by the sign of the headroom — all that matters
+    is that debt sorts ahead of slack."""
+    slack = row.get("slack_seconds")
+    if slack is not None:
+        return float(slack)
+    return float("inf") if row["headroom"] >= 0 else float("-inf")
+
+
+def humanize(seconds: int | None) -> str:
+    if seconds is None:
+        return "—"
+    if seconds <= 0:
+        return "reset"
+    days, rest = divmod(int(seconds), 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def fmt_span(seconds: int | None) -> str:
+    """A span for gate messages. Unlike `humanize`, a remainder under a minute is
+    not "0m" and certainly not "reset", but "< 1m"."""
+    if seconds is None:
+        return "—"
+    if seconds < 60:
+        return "< 1m"
+    return humanize(seconds)
+
+
+def fmt_slack(seconds: int | None) -> str:
+    """The gap in time with a sign: + behind the line (slack), - ahead of it (debt)."""
+    if seconds is None:
+        return "—"
+    if seconds == 0:
+        return "0"
+    return f"{'+' if seconds > 0 else '-'}{humanize(abs(seconds))}"
+
+
+def slack_text(row: dict) -> str:
+    """The gap in one cell. When the line cannot catch up at all, the number lies:
+    it saturates at the reset time and reads as "catches up exactly at the reset",
+    while in fact it never does — so we say that in words instead."""
+    if row.get("catch_up_possible") is False:
+        return "never"
+    return fmt_slack(row.get("slack_seconds"))
+
+
+def slack_cell(row: dict) -> str:
+    """Slack for tables. A window whose reset time has already passed (which only
+    happens with a stale snapshot) has no slack: its counter was cleared long ago,
+    and the number would be computed from dead figures — next to "reset" that would
+    read as real headroom."""
+    left = row.get("seconds_left")
+    if left is not None and left <= 0:
+        return "—"
+    return slack_text(row)
+
+
+def _slack_note(row: dict) -> str | None:
+    """The part of a debt that a single number does not convey: the line will not
+    catch up within the window, only the reset will clear it. There is exactly one
+    such case and it is named directly — the spend is above the window cap; the line
+    itself reaches 100% by the reset, so everything below the cap is recovered."""
+    if row.get("verdict") == "ok" or row.get("slack_seconds") is None:
+        return None
+    if row.get("catch_up_possible") is not False:
+        return None
+    note = "the line will not catch up — only the window reset will"
+    if row.get("cap_own") is not None and row.get("used_own", 0) > row["cap_own"]:
+        note += f" (spend is above the cap of {row['cap_own']:.1f}%)"
+    return note
+
+
+def _problem_line(row: dict, with_margin: bool = True) -> str:
+    """One line about a window in trouble: the debt in time first, percents in
+    brackets."""
+    tag = "over the line" if row["verdict"] == "exceed" else "approaching the line"
+    text = (f"{tag}: {row['window']} — {slack_text(row)} "
+            f"({row['headroom']:+.1f} pp)")
+    if with_margin:
+        text += (f", warning threshold {humanize(row['soft_margin_seconds'])} "
+                 f"({row['soft_margin_pp']:.1f} pp)")
+    note = _slack_note(row)
+    if note:
+        text += f"; {note}"
+    return text
+
+
+def norm_share(rate_pph: float, window: str) -> float:
+    """A rate as a percentage of the NOMINAL one: 100% of the limit per window is
+    20 pp/h for 5h and 0.60 pp/h for 7d, a factor of 33 apart."""
+    norm = 100.0 / (WINDOW_SECONDS.get(window, DEFAULT_WINDOW_SECONDS) / 3600.0)
+    return rate_pph / norm * 100.0
+
+
+def print_table(headers: list[str], rows: list[list[str]],
+                aligns: str | None = None, indent: str = "") -> None:
+    """A table without borders: column alignment only. Borders get in the way of
+    copying and grepping the output, and the widths already guide the eye. Prints
+    nothing for an empty row set."""
+    if not rows:
+        return
+    aligns = aligns or "<" * len(headers)
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def line(cells: list[str]) -> str:
+        parts = [f"{c:{aligns[i]}{widths[i]}}" for i, c in enumerate(cells)]
+        return (indent + "  ".join(parts)).rstrip()
+    if any(headers):          # a nameless "key — value" table prints no header
+        print(line(headers))
+    for row in rows:
+        print(line(row))
+
+
+def snapshot_age(snap: dict | None) -> int | None:
+    """How old the snapshot is. Measured by apiFetchedAt (the last FULL API answer)
+    rather than fetchedAt: a statusline push refreshes the percentages but does not
+    confirm that access is still alive."""
+    at = (snap or {}).get("apiFetchedAt") or (snap or {}).get("fetchedAt")
+    return int(time.time() - at) if at else None
+
+
+# Quota access state: code -> (table label, what to do about it). A plain
+# "live / stale" pair was too coarse: a network glitch and a closed subscription
+# looked identical ("9h stale") although they are cured differently — and the fact
+# that the quota could not be read at all had to be inferred from the reason string.
+ACCESS_STATES = {
+    "live":            ("live", None),
+    "no_subscription": ("NO SUBSCRIPTION",
+                        "access is closed on the account side — check the"
+                        " subscription; refreshing the login will not help"),
+    "auth_expired":    ("LOGIN EXPIRED",
+                        "the token is stale but the subscription may be fine: start"
+                        " claude in this profile (the CLI refreshes the token), then"
+                        " run climits probe --force"),
+    "denied":          ("NO ACCESS", "the API refused — reason on the line below"),
+    "no_token":        ("NO TOKEN", "this profile has no OAuth token: claude auth login"),
+    "unreachable":     ("POLL FAILED",
+                        "the API did not answer (network, timeout) — the figures are"
+                        " from the previous poll"),
+    "throttled":       ("POLL RATE LIMIT",
+                        "the API throttled requests to /oauth/usage — wait it out;"
+                        " access and subscription are not involved"),
+    "no_data":         ("NO DATA", "there is no snapshot yet: climits probe --force"),
+}
+# probe states in which the figures are confirmed by the server right now.
+PROBE_LIVE_STATES = ("fresh", "updated", "locked")
+
+
+def access_state(probe_state: str, snap: dict | None, age: int | None) -> dict:
+    """One status for every output: code, table label, hint. The age of the data is
+    glued to the label (`POLL FAILED · 9h`) — without it "no access" says nothing
+    about how stale the figures next to it are, and that is exactly what decides
+    whether to trust them."""
+    if probe_state in PROBE_LIVE_STATES:
+        return {"state": "live", "label": ACCESS_STATES["live"][0], "hint": None}
+    state = "no_data" if not snap else probe_state
+    label, hint = ACCESS_STATES.get(state, ACCESS_STATES["denied"])
+    if snap and age is not None:
+        label = f"{label} · {humanize(age)}"
+    return {"state": state, "label": label, "hint": hint}
+
+
+def cmd_status(argv: list[str]) -> int:
+    if "--all" in argv:
+        return cmd_status_all(argv)
+    as_json = "--json" in argv
+    budget = load_budget()
+    email = account_email()
+    headless = _is_headless()
+    snap, reason, probe_state = probe(email, force="--force" in argv,
+                                      ttl=int(budget["defaults"]["poll_ttl_seconds"]))
+    # The CLI has no session of its own, so "what is in use" is taken from every
+    # session on the machine within the last hour — that way `status` shows the same
+    # picture the gate sees.
+    ttl = float(settings_for(budget, email).get("model_seen_ttl_minutes", 60)) * 60
+    models = models_recent(email, ttl)
+    report = evaluate(snap, budget, email, headless, models)
+    creds = oauth_credentials()
+    age = snapshot_age(snap)
+    stale_after = int(settings_for(budget, email).get("stale_after_seconds", 1800))
+    # The data is stale only if the API did not confirm it: a successful poll resets
+    # the age.
+    live = probe_state in PROBE_LIVE_STATES
+    stale = bool(snap) and not live and age is not None and age > stale_after
+    access = access_state(probe_state, snap, age)
+    no_access = access["state"] in ("no_subscription", "auth_expired", "denied", "no_token")
+    report.update({"account": email, "source": (snap or {}).get("source"),
+                   "fetchedAt": (snap or {}).get("fetchedAt"), "probe": reason,
+                   "models": models, "snapshot_age_seconds": age, "stale": stale,
+                   # `access` keeps the coarse three values, `state` is the exact
+                   # cause: it says what to fix, so tables never guess from a string.
+                   "access": "denied" if no_access else ("live" if live else "unknown"),
+                   "state": access["state"], "state_label": access["label"],
+                   "hint": access["hint"],
+                   "subscription": creds.get("subscriptionType"),
+                   "rate_limit_tier": creds.get("rateLimitTier"),
+                   "token_expired_at": token_expired_at(creds)})
+
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    snap_cell = f"{(snap or {}).get('source', '—')} ({reason})"
+    if snap and not live and age is not None:
+        snap_cell += (f"; data from "
+                      f"{time.strftime('%d %b %H:%M', time.localtime(time.time() - age))}"
+                      f", {humanize(age)} ago")
+    plan = (f"{creds.get('subscriptionType') or '—'}"
+            f" ({creds.get('rateLimitTier') or 'tier unknown'})")
+    head_rows = [["account", email or "unknown"],
+                 ["state", access["label"]],
+                 ["snapshot", snap_cell],
+                 ["plan", plan + " — from the CLI cache, not confirmed by the server"
+                          if no_access else plan],
+                 ["mode", "headless" if headless else "interactive"],
+                 ["models in use", ", ".join(models) if models
+                                   else f"none seen in {humanize(int(ttl))}"],
+                 ["config", "not found — using defaults (pace 100%)"
+                            if budget.get("_missing") else str(budget_path())]]
+    print_table(["", ""], head_rows)
+    print()
+
+    if no_access or stale:
+        # Printing the percentages as current after access is lost would be a plain
+        # lie: the spend could have gone anywhere and a five-hour window has turned
+        # over entirely. The figures below stay as the last known state, but they are
+        # labelled with their own timestamp.
+        if no_access:
+            print(f"! quota cannot be read: {access['label'].split(' · ')[0]} — {reason}")
+        if stale:
+            print(f"! last API answer was {humanize(age)} ago; the figures below are"
+                  " stale and are not the current spend.")
+        if access["hint"]:
+            print(f"  what to do: {access['hint']}")
+        print()
+
+    if report["verdict"] == "unknown":
+        print("no data about limits — the governor stays quiet (unknown never blocks)")
+        return 0
+
+    with_foreign = any(row.get("foreign_measure") for row in report["windows"])
+    headers = ["", "window", "used", "allowed", "free", "slack", "elapsed", "reset"]
+    if with_foreign:
+        headers.append("others")
+    rows, notes = [], []
+    for row in report["windows"]:
+        # A window that does not gate must not shout: "~" reads as "for information".
+        # Otherwise a scoped limit of somebody else's model would burn "!!" and train
+        # the eye to ignore the markers entirely — the very thing this branch exists
+        # to prevent.
+        mark = ({"ok": "", "soft": "!", "exceed": "!!"}[row["verdict"]] if row["gates"]
+                else ("~" if row["verdict"] != "ok" else ""))
+        head = row["headroom"]
+        measure = row.get("foreign_measure")
+        cells = [
+            mark, row["window"],
+            f"{row['used_own']:.1f}%", f"{row['allowed_own']:.1f}%",
+            f"{head:+.1f} pp" if row["elapsed_pct"] is not None else "—",
+            slack_cell(row),
+            f"{row['elapsed_pct']:.1f}%" if row["elapsed_pct"] is not None else "—",
+            humanize(row["seconds_left"]),
+        ]
+        if with_foreign:
+            cells.append(f"{measure['rate_pph']:.2f}/h "
+                         f"({norm_share(measure['rate_pph'], row['window']):.0f}%)"
+                         if measure else "—")
+        rows.append(cells)
+        # Below the table goes what is not always needed: the share, a reduced pace
+        # and the layer 2 breakdown. They do not fit in a row, yet without them there
+        # is no telling why the gate is holding things back.
+        if row.get("scope_note"):
+            notes.append(f"{row['window']}: {row['scope_note']}"
+                         + ("" if row["gates"] else " — this window does not gate"))
+        if not row["gates"]:
+            continue            # further notes about a non-gating window are noise
+        if row["share"] != 1.0:
+            notes.append(f"{row['window']}: share {row['share']*100:.0f}% — percentages "
+                         f"recomputed into units of your own quota")
+        if row["pace_factor"] != 1.0 and not measure:
+            notes.append(f"{row['window']}: pace {row['pace_factor']:.0%} from config")
+        if measure:
+            notes.append(f"{row['window']}: {humanize(measure['clean_seconds'])} clean "
+                         f"across {measure['intervals']} intervals -> reserved for "
+                         f"others {row['foreign_reserve_pp']:.1f} pp, cap "
+                         f"{row['cap_own']:.1f}%")
+    print_table(headers, rows, aligns="><>>>>>><"[:len(headers)])
+    if notes:
+        print()
+        for note in notes:
+            print(f"  {note}")
+
+    verdict_text = {
+        "ok": "within the pace line",
+        "soft": "approaching the pace line — warning",
+        "exceed": f"spend is over the pace line -> policy "
+                  f"{budget['defaults']['on_exceed']} / headless "
+                  f"{budget['defaults']['on_exceed_headless']}",
+    }[report["verdict"]]
+    print()
+    if no_access or stale:
+        verdict_text = f"by the last known snapshot — {verdict_text}"
+    print(f"verdict:  {verdict_text}")
+    # Every window with a problem, not only the tightest. While one was printed, the
+    # second hid quietly behind it — and the habit of ignoring a message about a
+    # window known to be irrelevant devalued the warning as a whole.
+    for row in report.get("problems") or []:
+        print(f"          {_problem_line(row)}")
+    # Windows that are over the line but do not constrain our work get their own line
+    # and no alarm: they must not look like something to react to.
+    for row in report["windows"]:
+        if row["gates"] or row["verdict"] == "ok":
+            continue
+        print(f"          note: {row['window']} is over the line "
+              f"({row['headroom']:+.1f} pp) but does not gate — {row['scope_note']}")
+    return 0
+
+
+def config_dirs() -> list[str]:
+    """Every config dir on the machine: the base `~/.claude` plus the profiles under
+    `~/.claude/profiles/*`. A directory counts as a profile when it has its own
+    `.credentials.json` — only then does it have an account of its own."""
+    base = os.path.expanduser("~/.claude")
+    dirs = [base]
+    profiles = os.path.join(base, "profiles")
+    if os.path.isdir(profiles):
+        dirs += [os.path.join(profiles, name) for name in sorted(os.listdir(profiles))]
+    return [d for d in dirs if os.path.exists(os.path.join(d, ".credentials.json"))]
+
+
+def summary_table(reports: list[dict]) -> tuple[list[str], list[list[str]], str]:
+    """The `status --all` summary: one row per window, the account named once.
+
+    The "state" column replaced the former "snapshot" one: it answers not "when was
+    it refreshed" but "can the quota be read at all, and if not, why" — which is what
+    the summary was missing. The "slack" column is the same gap as "allowed", only in
+    TIME: percentages are not comparable across windows (the lines differ in
+    steepness by a factor of 33), and "-3.6 pp" on the weekly window is almost seven
+    hours of debt, while the same points on the five-hour one are recovered in a
+    quarter of an hour."""
+    headers = ["", "account", "window", "used", "allowed", "slack", "reset", "state"]
+    rows = []
+    for report in reports:
+        gating = [r for r in report.get("windows") or [] if r.get("gates")]
+        state = report.get("state_label") or "—"
+        if not gating:
+            rows.append(["", report["label"], "—", "—", "—", "—", "—", state])
+            continue
+        for i, row in enumerate(gating):
+            mark = {"ok": "", "soft": "!", "exceed": "!!"}[row["verdict"]]
+            rows.append([mark, report["label"] if i == 0 else "",
+                         row["window"], f"{row['used_own']:.1f}%",
+                         f"{row['allowed_own']:.1f}%", slack_cell(row),
+                         humanize(row["seconds_left"]),
+                         state if i == 0 else ""])
+    return headers, rows, "><<>>>><"
+
+
+def cmd_status_all(argv: list[str]) -> int:
+    """A summary across EVERY account on the machine. Each profile is polled by a
+    separate process: the account, token and config all come from CLAUDE_CONFIG_DIR,
+    and swapping it on the fly inside one process is impossible — some paths are
+    already cached."""
+    as_json = "--json" in argv
+    reports, seen = [], set()
+    for cdir in config_dirs():
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=cdir)
+        try:
+            out = subprocess.run([sys.executable, os.path.abspath(__file__),
+                                  "status", "--json"],
+                                 capture_output=True, text=True, timeout=60,
+                                 check=False, env=env)
+            report = json.loads(out.stdout)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+        if report.get("account") and report["account"] in seen:
+            continue                      # `~/.claude` and a profile may share an account
+        seen.add(report.get("account"))
+        report["config_dir"] = cdir
+        # The account may not have resolved (no network, broken login) — label it by
+        # directory then, or the summary grows a nameless row nobody can place.
+        report["label"] = report.get("account") or f"<{os.path.basename(cdir)}>"
+        reports.append(report)
+    if as_json:
+        print(json.dumps(reports, ensure_ascii=False, indent=2))
+        return 0
+    if not reports:
+        print("no accounts found")
+        return 0
+
+    headers, rows, aligns = summary_table(reports)
+    print_table(headers, rows, aligns=aligns)
+    print()
+    for report in reports:
+        verdict = {"ok": "within the pace line", "soft": "approaching the line",
+                   "exceed": "over the line",
+                   "unknown": "no data"}.get(report.get("verdict"), "?")
+        state = report.get("state") or "live"
+        age = humanize(report.get("snapshot_age_seconds"))
+        if state == "live":
+            pass
+        elif state in ("unreachable", "throttled", "no_data"):
+            # Access was not taken away, there is simply nothing to confirm the
+            # figures with; the verdict stands, but honestly labelled with the age of
+            # the data it was computed from.
+            verdict = f"{verdict} (snapshot {age} old, no fresh data)"
+        else:
+            verdict = f"quota cannot be read — {report.get('state_label')}"
+        print(f"  {report['label']}: {verdict}")
+        # How big the overrun actually is, in time. The summary used to stop at the
+        # word "over" and finding out whether that meant nine minutes or seven hours
+        # required running a single-account `status` under the right profile.
+        if state not in ("no_subscription", "auth_expired", "denied", "no_token"):
+            for row in report.get("problems") or []:
+                print(f"      {_problem_line(row, with_margin=False)}")
+        if state != "live":
+            print(f"      {report.get('probe')}")
+            if report.get("hint"):
+                print(f"      what to do: {report['hint']}")
+    return 0
+
+
+def cmd_probe(argv: list[str]) -> int:
+    budget = load_budget()
+    email = account_email()
+    snap, reason, state = probe(email, force="--force" in argv,
+                                ttl=int(budget["defaults"]["poll_ttl_seconds"]))
+    print(f"{reason}: {snapshot_path(email)}")
+    hint = ACCESS_STATES.get(state, (None, None))[1]
+    if hint:
+        print(f"what to do: {hint}")
+    # Success means a confirmed API answer only: holding an old snapshot, `probe`
+    # did not do what it was called for, and a silent exit 0 would hide that from
+    # scripts.
+    return 0 if state in PROBE_LIVE_STATES else 1
+
+
+def cmd_speed(argv: list[str]) -> int:
+    """Layer 2 laid bare — an optional add-on for shared accounts."""
+    module = foreign_module()
+    if module is None:
+        print("layer 2 is not installed (lib/foreign.py is missing)")
+        print("it only makes sense on an account shared with other people —"
+              " see docs/shared-account.md")
+        return 1
+    return module.cmd_speed(argv, sys.modules[__name__])
+
+
+def cmd_agents(argv: list[str]) -> int:
+    """Subagent spend — exact, from their transcripts (accumulated by `SubagentStop`).
+
+    Answers the question a narrow hook matcher could not: how much a wave of agents
+    actually eats and what a single agent costs. The average is the raw material for
+    a throttle on fan-out; the total is what you reconcile against the growth of
+    `used_own`."""
+    email = account_email()
+    hours = 24.0
+    if "--hours" in argv:
+        try:
+            hours = float(argv[argv.index("--hours") + 1])
+        except (IndexError, ValueError):
+            pass
+    since = time.time() - hours * 3600
+    records = [r for r in agents_read(email) if r["t"] >= since]
+
+    def total(record: dict) -> int:
+        """Everything that went to the model except cache reads: those are an order
+        of magnitude cheaper, and counting them together with the rest is a reliable
+        way to inflate the figure several-fold."""
+        return sum(int(record.get(key) or 0)
+                   for key in ("input", "output", "cache_creation"))
+
+    by_type: dict[str, list[dict]] = {}
+    for record in records:
+        by_type.setdefault(str(record.get("type") or "?"), []).append(record)
+    summary = {
+        "account": email, "hours": hours, "agents": len(records),
+        "tokens": sum(total(r) for r in records),
+        "output_tokens": sum(int(r.get("output") or 0) for r in records),
+        "cache_read_tokens": sum(int(r.get("cache_read") or 0) for r in records),
+        "avg_tokens": (sum(total(r) for r in records) / len(records)) if records else None,
+        "by_type": {name: {"agents": len(items),
+                           "tokens": sum(total(r) for r in items),
+                           "avg_tokens": sum(total(r) for r in items) / len(items)}
+                    for name, items in sorted(by_type.items())},
+    }
+    if "--json" in argv:
+        print(json.dumps({**summary, "records": records}, ensure_ascii=False, indent=2))
+        return 0
+
+    print_table(["", ""], [["account", email or "unknown"],
+                           ["window", f"last {humanize(int(hours * 3600))}"],
+                           ["agents finished", str(len(records))]])
+    if not records:
+        print()
+        print("  no records. Accounting only appears when the climits hook is wired"
+              " to SubagentStop — check your settings")
+        return 0
+    print()
+    print_table(["agent type", "agents", "tokens", "average", "of which output"],
+                [[name, str(data["agents"]), _thousands(data["tokens"]),
+                  _thousands(data["avg_tokens"]),
+                  _thousands(sum(int(r.get("output") or 0) for r in by_type[name]))]
+                 for name, data in summary["by_type"].items()],
+                aligns="<>>>>", indent="  ")
+    print()
+    print(f"  {_thousands(summary['tokens'])} tokens in total, "
+          f"{_thousands(summary['avg_tokens'])} per agent on average "
+          f"(cache reads excluded: {_thousands(summary['cache_read_tokens'])})")
+    return 0
+
+
+def cmd_feed(_argv: list[str]) -> int:
+    """statusLine bridge — a free sensor: Claude Code hands the statusline a
+    `rate_limits` block on stdin, with no network call involved. Must ALWAYS print a
+    line, otherwise the status line goes blank."""
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError:
+        payload = {}
+    email = account_email()
+    limits = (payload.get("rate_limits") or {}) if isinstance(payload, dict) else {}
+    windows = {}
+    for name in ("five_hour", "seven_day"):
+        block = limits.get(name)
+        if isinstance(block, dict) and block.get("used_percentage") is not None:
+            windows[name] = {"used": float(block["used_percentage"]),
+                             "resets_at": block.get("resets_at")}
+    if windows:
+        now = int(time.time())
+        for window in windows.values():
+            window["updated_at"] = now
+        previous = read_snapshot(email) or {}
+        # The statusline only sends some of the windows (`seven_day` may be absent
+        # per the schema, and scoped ones are never there) — previous values have to
+        # survive the push, or a partial payload would erase the tightest window.
+        merged = dict(previous.get("windows") or {})
+        merged.update(windows)
+        _atomic_write(snapshot_path(email), {
+            "account": email, "fetchedAt": now,
+            "apiFetchedAt": previous.get("apiFetchedAt", 0),
+            "source": "statusline", "windows": merged,
+        })
+        # Rendering a line spends no tokens, so activity is NOT stamped here: every
+        # move of ours is already marked by the gate on `UserPromptSubmit`.
+        history_append(email, windows, activity_last(email))
+
+    budget = load_budget()
+    # The statusline knows the session model right in the payload — the cheapest and
+    # most accurate source for deciding whether a scoped window gates.
+    block = (payload.get("model") or {}) if isinstance(payload, dict) else {}
+    model = block.get("display_name") or "?"
+    ttl = float(settings_for(budget, email).get("model_seen_ttl_minutes", 60)) * 60
+    if block.get("id") or block.get("display_name"):
+        models_touch(email, payload.get("session_id"),
+                     [str(block.get("id") or block["display_name"])], ttl)
+    report = evaluate(read_snapshot(email), budget, email,
+                      models=models_recent(email, ttl))
+    parts = [model]
+    for row in report["windows"]:
+        if row["window"] in ("five_hour", "seven_day"):
+            label = "5h" if row["window"] == "five_hour" else "7d"
+        elif row["gates"]:
+            # A scoped window is shown only while it really constrains: the status
+            # line is narrow, and "7d fable" next to work on another model is noise.
+            label = _model_slug(row["scope_model"] or row["window"])[:6]
+        else:
+            continue
+        flag = {"ok": "", "soft": "!", "exceed": "!!"}[row["verdict"]]
+        parts.append(f"{label}:{row['used_own']:.0f}%{flag}")
+    print(" | ".join(parts))
+    return 0
+
+
+def _is_headless() -> bool:
+    """An interactive session can be asked a question (`ask`), a headless one cannot."""
+    if os.environ.get("CLIMITS_HEADLESS"):
+        return os.environ["CLIMITS_HEADLESS"] not in ("0", "", "false")
+    entrypoint = (os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "").lower()
+    return any(hint in entrypoint for hint in ("sdk", "print", "headless", "cron"))
+
+
+def _gate_log(record: dict) -> None:
+    path = os.path.join(state_dir(), "gate.log")
+    try:
+        if os.path.getsize(path) > 1_000_000:
+            os.replace(path, f"{path}.1")
+    except OSError:
+        pass
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _strikes(email: str | None, verdict: str, commit: bool = True) -> int:
+    """How many times in a row we ran into an exhausted quota. Used to grow the
+    backoff before a repeated refusal. In dry-run `commit=False`: observing must not
+    change state."""
+    path = os.path.join(state_dir(), f"{account_key(email)}.strikes.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = {"count": 0, "at": 0}
+    if verdict != "exceed" or time.time() - data.get("at", 0) > 900:
+        data = {"count": 0, "at": 0}
+    if verdict == "exceed":
+        data = {"count": data["count"] + 1, "at": int(time.time())}
+    if commit:
+        _atomic_write(path, data)
+    return data["count"]
+
+
+def _ask_allowed(email: str | None, cooldown_minutes: float, commit: bool = True) -> bool:
+    """Asking the user is a rare event. Between questions the gate stays quiet and
+    only warns, otherwise on an exhausted quota it would ask on every Bash and Task.
+    In dry-run `commit=False`, or observation would eat the right to ask."""
+    path = os.path.join(state_dir(), f"{account_key(email)}.ask.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            last = float(json.load(fh).get("at", 0))
+    except (OSError, ValueError, TypeError):
+        last = 0.0
+    if time.time() - last < cooldown_minutes * 60:
+        return False
+    if commit:
+        _atomic_write(path, {"at": int(time.time())})
+    return True
+
+
+def _warn_allowed(email: str | None, cooldown_minutes: float, commit: bool = True) -> bool:
+    """A warning is a rare event too. On a narrow matcher the gate printed a line
+    every few minutes by itself; on `*` (needed to see the tools subagents run) the
+    warning would go out on every single Read without this lock."""
+    path = os.path.join(state_dir(), f"{account_key(email)}.warn.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            last = float(json.load(fh).get("at", 0))
+    except (OSError, ValueError, TypeError):
+        last = 0.0
+    if time.time() - last < cooldown_minutes * 60:
+        return False
+    if commit:
+        _atomic_write(path, {"at": int(time.time())})
+    return True
+
+
+def _window_phrase(row: dict) -> str:
+    """One window in plain words. The gap to the line ("2 pp to spare") matters more
+    than the used/allowed pair it would otherwise have to be derived from, and in
+    TIME it is also comparable across windows: 2 pp is six minutes on the five-hour
+    window and three hours on the weekly one."""
+    head = row["headroom"]
+    if head >= 0:
+        gap = f", {head:.1f} pp to spare ({fmt_span(row.get('slack_seconds'))})"
+    elif row.get("catch_up_possible") is False:
+        gap = (f", over by {-head:.1f} pp, the line will not recover it — spend is "
+               f"above the cap of {row['cap_own']:.1f}%, wait for the reset")
+    else:
+        catch_up = row.get("wait_seconds")
+        gap = (f", over by {-head:.1f} pp"
+               + (f", the norm catches up in {fmt_span(catch_up)}" if catch_up else ""))
+    return (f"{row['window']}: used {row['used_own']:.0f}%, "
+            f"allowed by this minute {row['allowed_own']:.0f}%" + gap
+            + f", reset in {humanize(row['seconds_left'])}")
+
+
+def _decide(report: dict, budget: dict, headless: bool, strikes: int,
+            email: str | None = None, commit: bool = True,
+            event: str | None = None) -> dict:
+    """The gate decision in hook-JSON terms. The unknown NEVER blocks.
+
+    `event` is the hook event name. It matters because `permissionDecision` is only
+    understood by `PreToolUse`; on other events such an answer is invalid and is
+    silently dropped."""
+    tightest = report.get("tightest")
+    if report["verdict"] in ("unknown", "ok") or not tightest:
+        return {"action": "allow", "output": {}}
+
+    defaults = settings_for(budget, email)
+    mode = "headless" if headless else "interactive"
+    # ALL windows in trouble go out, not just the tightest. Previously one was
+    # printed, and the window a person had learned to ignore (a scoped one) covered
+    # up the real one.
+    problems = report.get("problems") or [tightest]
+    where = "; ".join(_window_phrase(row) for row in problems)
+
+    # The icon at the start of the line is not decoration: an `ask` from a hook is
+    # shown as an ORDINARY permission dialog, and without a visible prefix it is
+    # indistinguishable from a routine request to run Bash. That is exactly how the
+    # question used to get lost.
+    if report["verdict"] == "soft":
+        return {"action": "warn", "output": {
+            "systemMessage": f"⚠️ climits — approaching the line, {where}"}}
+
+    # A short overrun is no reason to disturb anyone: wait until the line catches up
+    # with the spend and let the call through. That way both headless and interactive
+    # sessions continue on their own. The wait must cover ALL windows over the line,
+    # not just the tightest: otherwise the pause ends while the second window is
+    # still behind, and the very next call trips again.
+    waits = [row["wait_seconds"] for row in problems
+             if row["verdict"] == "exceed" and row.get("wait_seconds") is not None]
+    wait = max(waits) if waits else None
+    max_wait = _by_key(defaults.get("max_wait_seconds"), mode,
+                       300.0 if headless else 60.0)
+    if wait is not None and wait <= max_wait:
+        return {"action": "wait", "wait_seconds": wait, "output": {
+            "systemMessage": f"⏳ climits — pausing {wait}s while the line catches up"
+                             f" ({where})"}}
+
+    if headless:
+        # The session is NEVER ended: an overnight run must survive days of refusals
+        # and continue once the line grows. Instead of stopping, the refusal is
+        # preceded by a growing pause: it damps the retry rate and with it the tokens
+        # spent on the retries themselves.
+        backoff = min(max_wait, 30.0 * (2 ** max(strikes - 1, 0)))
+        return {"action": "deny", "wait_seconds": int(backoff), "output": {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"LIMIT — spend is over the pace line ({where}). Do not continue"
+                    f" working: call ScheduleWakeup with delaySeconds="
+                    f"{min(max(int(wait or 3600), 60), 3600)} and end your turn. Do"
+                    f" not close the session: work resumes after the pause."
+                ),
+            }}}
+
+    # A question is only shown through `permissionDecision`, which only `PreToolUse`
+    # understands. On other events the right to ask is NOT spent: otherwise
+    # `UserPromptSubmit` (which runs first on every prompt) would take it and return
+    # an answer the CLI ignores — the question would never arrive.
+    if event is not None and event != "PreToolUse":
+        return {"action": "warn-no-ask", "output": {
+            "systemMessage": f"⚠️ climits — over the line, {where} "
+                             f"(you will be asked on the next tool call)"}}
+
+    if not _ask_allowed(email, float(defaults.get("ask_cooldown_minutes", 30)), commit):
+        return {"action": "warn-throttled", "output": {
+            "systemMessage": f"⚠️ climits — over the line, {where} (question deferred)"}}
+
+    tight_pct = f"{tightest['used_own']:.0f}/{tightest['allowed_own']:.0f}%"
+    return {"action": "ask", "output": {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "permissionDecisionReason": (
+            f"LIMIT {tight_pct} — spend is over the pace line ({where}). "
+            f"Continue anyway, or wait for the reset?"
+        ),
+    }}}
+
+
+def cmd_gate(argv: list[str]) -> int:
+    """The entry point for hooks. Dry-run by default: it only writes to the log and
+    decides nothing."""
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    budget = load_budget()
+    enforce = "--enforce" in argv or bool(budget["defaults"].get("enforce"))
+    email = account_email()
+    headless = _is_headless()
+    # The order matters for layer 2: first read the previous activity stamp (the
+    # history point will see it), then poll the API, and only then stamp ourselves —
+    # with the time the call STARTED, or our own stamp would make the next interval
+    # dirty.
+    started = time.time()
+    last_act = activity_last(email)
+    snap, reason, _state = probe(email, ttl=int(budget["defaults"]["poll_ttl_seconds"]),
+                                 last_act=last_act)
+    activity_touch(email, started)
+    # The model of OUR session, not "whatever runs on the machine": a scoped window
+    # must gate the session that spends that model and leave a neighbouring session
+    # on another model alone.
+    models = session_models(
+        email, payload,
+        float(settings_for(budget, email).get("model_seen_ttl_minutes", 60)) * 60)
+    report = evaluate(snap, budget, email, headless, models)
+    # strikes only accumulate headless: interactively there is no refusal, there is a
+    # question to the user
+    strikes = _strikes(email, report["verdict"] if headless else "ok", enforce)
+
+    event = payload.get("hook_event_name")
+    # `SubagentStop` is the only event that brings a FACT of spend: its payload
+    # carries the path to the finished agent's transcript, and the transcript carries
+    # the tokens. There is nothing to decide (the agent is already gone), so we only
+    # count and record.
+    agent_tokens = None
+    if event == "SubagentStop":
+        agent_tokens = agent_usage_from_transcript(payload.get("agent_transcript_path") or "")
+        if agent_tokens and enforce:
+            agents_append(email, {
+                "t": int(time.time()),
+                "agent": payload.get("agent_id"),
+                "type": payload.get("agent_type"),
+                "session": payload.get("session_id"),
+                **agent_tokens,
+            })
+        # A subagent may have run a DIFFERENT model than the main loop, and it really
+        # does spend that model's scoped window. Append it to the session models, or
+        # that window would count as foreign and would not gate a wave of agents.
+        agent_models = [m for m in (agent_tokens or {}).get("models") or []
+                        if m not in models]
+        if agent_models and enforce:
+            models_touch(email, payload.get("session_id"), models + agent_models,
+                         float(settings_for(budget, email)
+                               .get("model_seen_ttl_minutes", 60)) * 60)
+        decision = {"action": "agent-usage", "output": {}}
+    else:
+        decision = _decide(report, budget, headless, strikes, email, enforce, event=event)
+
+    # Warnings are muted by a cooldown: on the `*` matcher the gate runs on every
+    # tool, and without a lock the "climits ..." line would go out dozens of times a
+    # minute. The verdict is still logged as it is — only the text going out is muted.
+    muted = False
+    if decision["action"].startswith("warn"):
+        cooldown = float(settings_for(budget, email).get("warn_cooldown_minutes", 5))
+        if not _warn_allowed(email, cooldown, enforce):
+            muted = True
+            decision = {**decision, "output": {}}
+
+    _gate_log({
+        "t": int(time.time()),
+        "account": email,
+        "event": event,
+        "tool": payload.get("tool_name"),
+        "session": payload.get("session_id"),
+        # Tell the main loop from subagents ONLY by these fields: `session_id` for a
+        # call made inside a subagent is the same as the main loop's.
+        "agent": payload.get("agent_id"),
+        "agent_type": payload.get("agent_type"),
+        "entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+        "headless": headless,
+        "models": models,
+        "verdict": report["verdict"],
+        "tightest": report.get("tightest"),
+        # Every window with a problem, not only the tightest: with one window in the
+        # log there is no way to reconstruct whether a second overrun hid behind it.
+        "problems": [{"window": r["window"], "verdict": r["verdict"],
+                      "headroom": r["headroom"], "slack_seconds": r["slack_seconds"],
+                      # Reading the log afterwards, "-13h" and "never" are
+                      # indistinguishable: the first would have been cured by a pause,
+                      # the second only by the reset.
+                      "catch_up_possible": r["catch_up_possible"]}
+                     for r in report.get("problems") or []],
+        "ignored": [{"window": r["window"], "verdict": r["verdict"],
+                     "note": r.get("scope_note")}
+                    for r in report.get("windows") or [] if not r.get("gates")],
+        "probe": reason,
+        "action": decision["action"],
+        "muted": muted,
+        "agent_tokens": agent_tokens,
+        "enforced": enforce,
+    })
+
+    if not enforce:
+        # dry-run: the decision is computed and logged, but an empty answer goes out
+        print("{}")
+        return 0
+
+    # `wait` — sleep and let the call through (by then the overrun has dissolved);
+    # `deny` — sleep and refuse, to damp the retries. The pause must not run into the
+    # hook timeout: the `timeout` in settings.json has to exceed max_wait_seconds.
+    if decision.get("wait_seconds"):
+        time.sleep(decision["wait_seconds"])
+
+    print(json.dumps(decision["output"], ensure_ascii=False))
+    return 0
+
+
+COMMANDS = {"status": cmd_status, "probe": cmd_probe, "feed": cmd_feed,
+            "gate": cmd_gate, "speed": cmd_speed, "agents": cmd_agents}
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("--version", "-V"):
+        print(f"climits {VERSION}")
+        return 0
+    name = argv[0] if argv and not argv[0].startswith("-") else "status"
+    handler = COMMANDS.get(name)
+    if handler is None:
+        print(__doc__)
+        return 2
+    return handler(argv[1:] if argv and argv[0] == name else argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,18 @@
+{
+  "name": "climits",
+  "description": "climits — a pace governor for Claude Code subscription limits: warns, pauses or declines before the quota runs out.",
+  "owner": {
+    "name": "Valery Ivashchanka"
+  },
+  "plugins": [
+    {
+      "name": "climits",
+      "displayName": "climits",
+      "description": "Paces your Claude Code subscription usage: hooks that warn, pause or decline before the quota runs out.",
+      "source": "./",
+      "version": "0.1.0",
+      "license": "MIT",
+      "keywords": ["usage", "rate-limits", "quota", "pacing", "hooks"]
+    }
+  ]
+}
