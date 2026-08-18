@@ -13,8 +13,9 @@ So every margin in climits is stated in **time**:
 
 - `burst_minutes` — the head start, as "how much the line grows in N minutes";
 - `soft_margin_minutes` — how far ahead of the line the warning begins;
-- the `slack` column — `+2h 10m` (the line is that far behind you) or `-40m` (it
-  needs that long to catch up);
+- the `slack` column — `+2h 10m` (the line passed your current spend that long ago,
+  so you are under-spent by that much of the window's travel) or `-40m` (you are
+  over the line and it needs that long to catch up);
 - the tightest window is chosen by slack in seconds, not by points. Chosen by
   points, the wrong window regularly came out as the binding one.
 

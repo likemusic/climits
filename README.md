@@ -131,6 +131,14 @@ dependencies outside the Python standard library.
 
 ## Commands
 
+From inside a session, `/climits:status` runs the report and has Claude read it back
+to you in a sentence or two — where you stand relative to the line, which window is
+binding, and what it would take to get back on pace. It passes its arguments
+through, so `/climits:status --all` and `/climits:status agents` work too.
+
+Installing the plugin also puts `climits` on the Bash tool's PATH, and the commands
+below work from any shell if you add the repository's `bin/` to your own PATH.
+
 | command | what it does |
 |---|---|
 | `climits status` | the table above; `--json` for machines |
