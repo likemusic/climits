@@ -1,7 +1,7 @@
 {
   "name": "climits",
   "displayName": "climits",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Paces your Claude Code subscription usage: hooks that warn, pause or decline before the quota runs out, instead of letting you hit the wall mid-task.",
   "author": {
     "name": "Valery Ivashchanka"
@@ -18,6 +18,7 @@
     "hooks",
     "autonomous"
   ],
-  "commands": ["./commands/"],
-  "hooks": "./hooks/hooks.json"
+  "commands": [
+    "./commands/"
+  ]
 }

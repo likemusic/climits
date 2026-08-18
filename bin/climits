@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 DEFAULTS = {
     # Hooks only observe and log until this is switched on. Off by default on
