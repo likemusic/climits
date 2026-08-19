@@ -36,11 +36,16 @@ allowed to have spent **by this minute**", and it hangs on hooks, where it can a
 | `ok` | nothing at all |
 | `soft` | one muted warning line: you are approaching the line |
 | `exceed`, short | the hook **sleeps** until the line catches up, then lets the call through — the session never notices |
-| `exceed`, long, interactive | you are **asked** once (not per tool call): continue anyway or wait |
-| `exceed`, long, headless | the call is **declined** with a growing backoff, and the agent is told to call `ScheduleWakeup` and end the turn — the session is never killed |
+| `exceed`, longer, still curable | the hook **throttles**: it sleeps its maximum, lets the call through, and meets the next one the same way, pressing the spend back against the line |
+| `exceed`, beyond that, somebody at the keyboard | you are **asked** once (not per tool call): continue anyway or wait |
+| `exceed`, beyond that, nobody there | the call is **declined** with a growing backoff, and the agent is told to call `ScheduleWakeup` and end the turn — the session is never killed |
 
-That last row is the reason this exists: an overnight autonomous run that hits a
-limit at 3am should pause and resume, not die.
+The last two rows are the reason this exists: an overnight autonomous run that hits
+a limit at 3am should pause and resume, not die — and it must not stop to ask a
+question nobody is awake to answer. A permission dialog belongs to the CLI: once it
+is up no hook can withdraw it, so an unanswered one freezes the session for hours
+after the overrun it asked about has dissolved. Which is why the gate decides first
+whether anybody is there — see [Presence](#presence).
 
 ## The pace line
 
@@ -148,6 +153,7 @@ below work from any shell if you add the repository's `bin/` to your own PATH.
 | `climits feed` | status line bridge (reads the payload on stdin) |
 | `climits gate [--enforce]` | the hook entry point |
 | `climits speed` | output of the shared-account experiment, off unless enabled |
+| `climits presence [here\|away\|auto]` | who is at the keyboard — see below |
 
 ## Configuration
 
@@ -160,7 +166,12 @@ Everything has a default; the file is optional.
 | `burst_minutes` | head start, per window, in minutes of line growth |
 | `soft_margin_minutes` | how far before the line the `soft` warning starts |
 | `reserve_percent` | top of the quota never spent, so a task in flight can finish |
-| `max_wait_seconds` | longest silent pause; beyond it you get asked (or declined) |
+| `max_wait_seconds` | longest silent pause before a call is let through |
+| `throttle_max_seconds` | overruns up to this are throttled by repeated pauses; beyond it you get asked (or declined) |
+| `unattended_hours` | local-time window when nobody is expected, e.g. `"23:00-08:00"`; `null` disables it |
+| `away_after_unanswered_minutes` | a question left hanging this long proves nobody was there |
+| `away_auto_hours` | how long that self-diagnosed absence lasts |
+| `presence_override_hours` | default life of a hand-set `climits presence` |
 | `ask_cooldown_minutes` | how rarely the question may be asked |
 | `warn_cooldown_minutes` | how rarely the warning line may be printed |
 | `scoped_windows` | `auto` (default) / `always` / `never` — see below |
@@ -171,6 +182,34 @@ Values that differ by mode take an object: `{"interactive": 60, "headless": 300}
 Values that differ by window take an object keyed by window name:
 `{"five_hour": 30, "seven_day": 960}`. Per-account overrides go under
 `accounts["you@example.com"]`.
+
+### Presence
+
+Whether a question may be asked at all depends on whether anybody could answer it.
+The gate works that out from four sources, the more certain overriding the less:
+
+1. a session that cannot show a dialog at all (headless, or `CLIMITS_HEADLESS=1`);
+2. the gate's own conclusion: no hook fires while a permission dialog is up, so the
+   gap between issuing a question and the next call **is** the answer latency. One
+   left hanging past `away_after_unanswered_minutes` is proof that nobody was there,
+   and the gate marks itself unattended for `away_auto_hours`. It overrules a
+   hand-set `here` on purpose — a claim is what somebody said, a measurement is what
+   happened. Typing a prompt retires the conclusion: you are evidently back;
+3. a hand-set switch — `climits presence away` / `climits presence here`, or the
+   `/climits:presence` slash command, which understands "I am off to bed" as well as
+   the flag;
+4. `unattended_hours` on the clock.
+
+A hand-set switch always expires. Without `--for 8h` / `--until 08:00` it lasts
+`presence_override_hours`, and a `here` is capped at the opening of the next
+unattended window on top of that. The reason is a limit of the measurement in point
+2: falling asleep cannot be *detected* until a question has already frozen the
+session for the rest of the night — the latency is only readable once the session
+moves again, which needs your keypress. So the first hung question is the one thing
+the gate cannot save you from, and the clock has to prevent it in advance.
+
+With nobody there the ladder ends in throttling and, past `throttle_max_seconds`, in
+a refusal with a scheduled wake-up. Nothing is ever asked.
 
 ### Per-model weekly windows
 

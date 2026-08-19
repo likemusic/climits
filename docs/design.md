@@ -89,11 +89,51 @@ bad the number looks:
   and both interactive and autonomous runs continue by themselves. The sleep covers
   **all** windows over the line, not just the tightest — otherwise the pause ends
   while the second window is still behind and the next call trips again.
-- longer, interactive → ask, at most once per `ask_cooldown_minutes`.
-- longer, headless → decline, with a backoff that doubles per consecutive strike,
-  and tell the agent to schedule a wake-up and end its turn. **The session is never
-  ended.** An overnight run must survive days of refusals and continue when the line
-  grows.
+- longer, but still curable by the line, up to `throttle_max_seconds` → **throttle**:
+  sleep the maximum wait, let the call through, and meet the next call the same way.
+  Nobody is asked and nothing is scheduled; spending is simply pressed back against
+  the line, because every call over it costs a pause. This is the branch that keeps
+  an unattended session moving instead of freezing it.
+- beyond that, with somebody at the keyboard → ask, at most once per
+  `ask_cooldown_minutes`.
+- beyond that, with nobody there → decline, with a backoff that doubles per
+  consecutive strike, and tell the agent to schedule a wake-up and end its turn.
+  **The session is never ended.** An overnight run must survive days of refusals and
+  continue when the line grows.
+
+## Why presence is a first-class input
+
+A question is not a free fallback. The permission dialog belongs to the CLI: the
+hook has already returned its JSON and exited by the time the dialog appears, and
+nothing — not the gate, not a later hook, not the passage of time — can withdraw it.
+While it is up, no hook fires at all, so the gate cannot even re-evaluate. Asked at
+04:00 about an overrun the line would cure in ten minutes, it still sits there at
+09:00, and the session it froze did nothing for five hours.
+
+So the gate first decides **whether anybody could answer**, and only then whether to
+ask. Four sources, the more certain overriding the less: a session with no dialog to
+show (headless, `CLIMITS_HEADLESS=1`); the gate's own measured conclusion; a hand-set
+`climits presence here|away`; the `unattended_hours` clock. The measurement outranks
+the switch deliberately — a claim is what somebody said, a measurement is what
+happened, and "I am here" followed by a slept-through question is exactly the case
+where the claim is the stale half.
+
+The conclusion is measured, not guessed, and the measurement falls out of the same
+property that makes an unanswered question so costly: **no hook fires while a dialog
+is up**, so the gap between issuing a question and the next call *is* how long it
+hung. Past `away_after_unanswered_minutes` that is proof nobody was there, and the
+gate marks itself unattended for `away_auto_hours` rather than asking again. A typed
+prompt retires the conclusion — somebody is evidently back. That last rule also
+means a `/loop` wake-up clears it, which is why the clock exists as well: at night
+the hours rule holds regardless.
+
+Every hand-set switch expires, and a `here` also dies when the unattended window
+opens unless an explicit `--for`/`--until` says otherwise. This is not tidiness but
+the one gap the measurement cannot close: the latency of a question is only readable
+once the session moves again, and the session cannot move until somebody answers.
+The FIRST question slept through therefore costs the whole night no matter what — the
+gate only learns from it afterwards. Everything preventive has to come from the
+clock, so an evening `here` must never reach the night unnoticed.
 
 Two implementation details that are easy to get wrong:
 

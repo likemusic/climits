@@ -701,6 +701,122 @@ def main() -> int:
         expired = dict(debt_row, seconds_left=-500)
         check(climits.slack_cell(expired) == "—",
               "a reset window is not given invented slack", climits.slack_cell(expired))
+
+        print("23. A long overrun is throttled, not turned into a hanging question")
+        # The regression this guards: a 10-minute overrun in a night session put up a
+        # permission dialog, which nobody answered until morning. The line caught up
+        # ten minutes later, but a dialog is the CLI's — no hook can withdraw it, so
+        # the session stayed frozen for hours over a problem that had already gone.
+        write_history(climits, [])
+        thr_cfg = budget(climits, dict(base, enforce=True,
+                                       pace_factor={"interactive": 1.0, "headless": 1.0},
+                                       max_wait_seconds={"interactive": 60, "headless": 300},
+                                       throttle_max_seconds=7200), {"enabled": False})
+        mild = climits.evaluate(snapshot(now, 51.6, half), thr_cfg, "test", False)
+        mild_row = next(r for r in mild["windows"] if r["window"] == WINDOW)
+        check(mild["verdict"] == "exceed" and 60 < mild_row["wait_seconds"] <= 7200,
+              "the fixture is an overrun longer than the pause but shorter than the cap",
+              f"wait {mild_row['wait_seconds']}s")
+
+        here = climits._decide(mild, thr_cfg, False, 0, "test", False,
+                               event="PreToolUse", attended=True)
+        check(here["action"] == "throttle" and here["wait_seconds"] == 60,
+              "with somebody at the keyboard the call is throttled, not asked about",
+              f"{here['action']} / {here.get('wait_seconds')}")
+        away = climits._decide(mild, thr_cfg, False, 0, "test", False,
+                               event="PreToolUse", attended=False)
+        check(away["action"] == "throttle" and away["wait_seconds"] == 300,
+              "with nobody there the pause is the longer, headless one",
+              f"{away['action']} / {away.get('wait_seconds')}")
+
+        # Above the cap the line will never catch up, so throttling would be a lie:
+        # that is the one case still worth a question — and a refusal when there is
+        # nobody to ask.
+        deep = climits.evaluate(snapshot(now, 99.0, half), thr_cfg, "test", False)
+        refused = climits._decide(deep, thr_cfg, False, 0, "test", False,
+                                  event="PreToolUse", attended=False)
+        check(refused["action"] == "deny"
+              and "ScheduleWakeup" in json.dumps(refused["output"]),
+              "an unattended session is declined and told to reschedule, never asked",
+              refused["action"])
+        # The cooldown from scenario 11 is still ticking in the shared state dir —
+        # retire it, or this would measure throttling of questions instead.
+        climits._atomic_write(os.path.join(os.environ["CLIMITS_STATE_DIR"],
+                                           f"{climits.account_key('test')}.ask.json"),
+                              {"at": 0})
+        asked = climits._decide(deep, thr_cfg, False, 0, "test", True,
+                                event="PreToolUse", attended=True)
+        check(asked["action"] == "ask",
+              "the unrecoverable case is still a question when somebody is there",
+              asked["action"])
+
+        print("24. Who is at the keyboard: the clock, the switch, and the gate's guess")
+        def at_local(hour: int, minute: int = 0) -> float:
+            local = list(time.localtime(now))
+            local[3], local[4], local[5] = hour, minute, 0
+            return time.mktime(time.struct_time(tuple(local)))
+
+        check(climits.in_unattended_hours("23:00-08:00", at_local(2))
+              and climits.in_unattended_hours("23:00-08:00", at_local(23, 30))
+              and not climits.in_unattended_hours("23:00-08:00", at_local(12)),
+              "a night window crossing midnight is read as two sides, not one interval")
+        check(not climits.in_unattended_hours(None, at_local(2))
+              and not climits.in_unattended_hours("nonsense", at_local(2)),
+              "an absent or malformed window disables the rule instead of failing")
+
+        night_cfg = budget(climits, dict(base, unattended_hours="23:00-08:00"))
+        climits.presence_write("test", None, None, "manual")
+        check(climits.attendance("test", night_cfg, False, at_local(2))["source"] == "hours"
+              and not climits.attendance("test", night_cfg, False, at_local(2))["attended"],
+              "inside the night window the gate expects nobody")
+        check(climits.attendance("test", night_cfg, False, at_local(12))["attended"],
+              "outside it the session is treated as attended again")
+
+        climits.presence_write("test", "here", now + 3600, "manual", "I am awake")
+        state = climits.attendance("test", night_cfg, False, at_local(2))
+        check(state["attended"] and state["source"] == "manual",
+              "a hand-set `here` overrides the clock", json.dumps(state))
+        # A claim is what somebody said; a measurement is what happened. Saying "I am
+        # here" and then sleeping through a question is precisely where the claim is
+        # the stale half, so the gate's own conclusion wins.
+        climits._atomic_write(os.path.join(os.environ["CLIMITS_STATE_DIR"],
+                                           f"{climits.account_key('test')}.ask.json"),
+                              {"at": now - 3600, "pending": True})
+        climits._ask_answered("test", night_cfg, True)
+        check(not climits.attendance("test", night_cfg, False, at_local(12))["attended"],
+              "a question slept through overrules the `here` that was claimed before it")
+        climits.presence_write("test", "away", now + 3600, "manual")
+        check(not climits.attendance("test", night_cfg, False, at_local(12))["attended"],
+              "and a hand-set `away` overrides it the other way too")
+        climits.presence_write("test", "away", now - 1, "manual")
+        check(climits.attendance("test", night_cfg, False, at_local(12))["attended"],
+              "an expired switch is no switch: a forgotten one must not last forever")
+
+        # The gate's own guess. No hook fires while a dialog is up, so the gap since
+        # the question was issued IS how long it hung unanswered.
+        climits.presence_write("test", None, None, "manual")
+        ask_file = os.path.join(os.environ["CLIMITS_STATE_DIR"],
+                                f"{climits.account_key('test')}.ask.json")
+        climits._atomic_write(ask_file, {"at": now - 3600, "pending": True})
+        guess = climits._ask_answered("test", night_cfg, True)
+        check(guess and guess["mode"] == "away" and guess["source"] == "auto",
+              "a question that hung an hour makes the gate call itself unattended",
+              json.dumps(guess))
+        check(not climits.attendance("test", night_cfg, False, at_local(12))["attended"],
+              "and that verdict holds through the day, not only at night")
+        check(climits._ask_answered("test", night_cfg, True) is None,
+              "the same question is not measured twice")
+        climits.presence_write("test", None, None, "auto")
+
+        # Falling asleep cannot be measured until a question has already frozen the
+        # session for the night, so an evening `here` must not reach the night at all.
+        opens = climits.next_unattended_start("23:00-08:00", at_local(21))
+        check(opens is not None and time.localtime(opens).tm_hour == 23
+              and opens - at_local(21) == 2 * 3600,
+              "the next opening of the night window is found on the clock",
+              str(opens))
+        check(climits.next_unattended_start(None) is None,
+              "with no night window there is nothing to cap a `here` against")
     finally:
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
         shutil.rmtree(state, ignore_errors=True)

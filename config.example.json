@@ -8,8 +8,14 @@
     "reserve_percent": {"interactive": 5.0, "headless": 5.0},
 
     "max_wait_seconds": {"interactive": 60, "headless": 300},
+    "throttle_max_seconds": 1800,
     "ask_cooldown_minutes": 30,
     "warn_cooldown_minutes": 5,
+
+    "unattended_hours": null,
+    "away_after_unanswered_minutes": 15,
+    "away_auto_hours": 8,
+    "presence_override_hours": 12,
 
     "scoped_windows": "auto",
     "poll_ttl_seconds": 300,

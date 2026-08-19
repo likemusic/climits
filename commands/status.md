@@ -1,12 +1,22 @@
 ---
 description: Show subscription usage against the pace line (5h / weekly windows)
-argument-hint: "[--all | probe --force | agents | speed]"
+argument-hint: "[--all | probe --force | agents | speed | presence]"
 allowed-tools: Bash(climits:*)
 ---
 
 Run `climits $ARGUMENTS` with the Bash tool — plain `climits status` when no
 arguments were given. The plugin puts `climits` on the Bash tool's PATH, so no path
-is needed. Then read the report and tell the user, in two or three sentences:
+is needed.
+
+Then answer in two parts, in this order.
+
+**First, the report itself.** Paste what the command printed into a fenced code
+block, verbatim and complete — the head rows and the table. The terminal collapses
+long tool output to a couple of lines, so a report that is only "on screen" is not
+actually readable; without this the figures below have nothing behind them. Do not
+reformat the columns, do not drop rows, do not round anything.
+
+**Then, below it, two or three sentences of reading:**
 
 - whether they are under or over the pace line, and by how much **in time**. The
   `slack` column carries this. `+2h 10m` means the line passed their current spend
@@ -19,6 +29,6 @@ is needed. Then read the report and tell the user, in two or three sentences:
   `never` (which means the spend is above the window cap and the line alone will not
   recover it).
 
-Do not reprint the table; the user can already see it. Do not convert the figures
-into predictions the report does not make. If the report says the quota cannot be
-read, relay its `what to do` line as it stands rather than guessing at the cause.
+Do not convert the figures into predictions the report does not make. If the report
+says the quota cannot be read, relay its `what to do` line as it stands rather than
+guessing at the cause.

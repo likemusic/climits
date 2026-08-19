@@ -14,6 +14,8 @@ Subcommands:
   feed              statusLine bridge: reads stdin, updates snapshot, prints a line
   agents [--json] [--hours N]  subagent spend: exact tokens from their transcripts
   gate   [--enforce]  decision for hooks (dry-run unless enforced)
+  presence [here|away|auto] [--for 8h|--until HH:MM]
+                    tell the gate whether anybody is at the keyboard
   speed  [--json]   optional layer 2: measured spend of OTHER people on a shared
                     account (only when lib/foreign.py is installed and enabled)
 
@@ -35,7 +37,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 DEFAULTS = {
     # Hooks only observe and log until this is switched on. Off by default on
@@ -80,15 +82,30 @@ DEFAULTS = {
     # catches up with the spend and then lets the call through. A human is only
     # worth interrupting when the wait would be long.
     "max_wait_seconds": {"interactive": 60, "headless": 300},
+    # A longer overrun that the line will still cure is THROTTLED, not escalated:
+    # the gate sleeps its maximum wait, lets the call through, and meets the next
+    # call the same way. Spending is pressed back against the line without anybody
+    # being asked. Beyond this span the sleeping stops being worth it and the
+    # session is either asked (somebody is there) or told to reschedule.
+    "throttle_max_seconds": 1800,
+    # Nobody at the keyboard: `"23:00-08:00"` in LOCAL time, null disables it. A
+    # question is only worth asking when somebody can answer it — an unanswered
+    # permission dialog freezes the session until morning, because the dialog
+    # belongs to the CLI and no hook can withdraw it once it is up.
+    "unattended_hours": None,
+    # A question left hanging longer than this is proof that nobody was there: the
+    # gate marks itself unattended for `away_auto_hours` and stops asking.
+    "away_after_unanswered_minutes": 15,
+    "away_auto_hours": 8,
+    # How long a hand-set `climits presence here|away` lasts without an explicit
+    # --for/--until. It expires on purpose: a forgotten `here` would disable the
+    # night policy for good.
+    "presence_override_hours": 12,
     "poll_ttl_seconds": 300,
     # A snapshot older than this is not "slightly stale", it is untrustworthy: a
     # five-hour window turns over completely by then, and printing its percentages
     # as current would be a lie.
     "stale_after_seconds": 1800,
-    "on_soft": "warn",
-    "on_exceed": "ask",
-    "on_exceed_headless": "deny",   # never end the session, only decline the call
-    "safety": 0.85,
     # Layer 2 — pace control on a SHARED account, where the counter is fed by
     # several people. Shipped as an optional module (lib/foreign.py) and disabled
     # by default; see docs/shared-account.md.
@@ -1178,6 +1195,7 @@ def cmd_status(argv: list[str]) -> int:
     budget = load_budget()
     email = account_email()
     headless = _is_headless()
+    presence = attendance(email, budget, headless)
     snap, reason, probe_state = probe(email, force="--force" in argv,
                                       ttl=int(budget["defaults"]["poll_ttl_seconds"]))
     # The CLI has no session of its own, so "what is in use" is taken from every
@@ -1195,7 +1213,9 @@ def cmd_status(argv: list[str]) -> int:
     stale = bool(snap) and not live and age is not None and age > stale_after
     access = access_state(probe_state, snap, age)
     no_access = access["state"] in ("no_subscription", "auth_expired", "denied", "no_token")
-    report.update({"account": email, "source": (snap or {}).get("source"),
+    report.update({"account": email, "attended": presence["attended"],
+                   "presence": presence,
+                   "source": (snap or {}).get("source"),
                    "fetchedAt": (snap or {}).get("fetchedAt"), "probe": reason,
                    "models": models, "snapshot_age_seconds": age, "stale": stale,
                    # `access` keeps the coarse three values, `state` is the exact
@@ -1224,6 +1244,9 @@ def cmd_status(argv: list[str]) -> int:
                  ["plan", plan + " — from the CLI cache, not confirmed by the server"
                           if no_access else plan],
                  ["mode", "headless" if headless else "interactive"],
+                 ["presence", ("somebody can be asked" if presence["attended"]
+                               else "nobody to ask — the gate throttles instead")
+                              + f" ({presence['source']}: {presence['detail']})"],
                  ["models in use", ", ".join(models) if models
                                    else f"none seen in {humanize(int(ttl))}"],
                  ["config", "not found — using defaults (pace 100%)"
@@ -1300,12 +1323,15 @@ def cmd_status(argv: list[str]) -> int:
         for note in notes:
             print(f"  {note}")
 
+    throttle_max = float(settings_for(budget, email).get("throttle_max_seconds", 1800))
     verdict_text = {
         "ok": "within the pace line",
         "soft": "approaching the pace line — warning",
-        "exceed": f"spend is over the pace line -> policy "
-                  f"{budget['defaults']['on_exceed']} / headless "
-                  f"{budget['defaults']['on_exceed_headless']}",
+        "exceed": "spend is over the pace line -> pause while the line catches up,"
+                  " then throttle; "
+                  + ("a question if the wait would be longer than "
+                     f"{fmt_span(int(throttle_max))}" if presence["attended"]
+                     else "then decline and reschedule — there is nobody to ask"),
     }[report["verdict"]]
     print()
     if no_access or stale:
@@ -1636,7 +1662,9 @@ def _ask_allowed(email: str | None, cooldown_minutes: float, commit: bool = True
     if time.time() - last < cooldown_minutes * 60:
         return False
     if commit:
-        _atomic_write(path, {"at": int(time.time())})
+        # `pending` is what makes the next call able to MEASURE the answer: while the
+        # dialog is up no hook fires, so the gap until the next call is the latency.
+        _atomic_write(path, {"at": int(time.time()), "pending": True})
     return True
 
 
@@ -1655,6 +1683,150 @@ def _warn_allowed(email: str | None, cooldown_minutes: float, commit: bool = Tru
     if commit:
         _atomic_write(path, {"at": int(time.time())})
     return True
+
+
+def presence_path(email: str | None) -> str:
+    return os.path.join(state_dir(), f"{account_key(email)}.presence.json")
+
+
+def presence_read(email: str | None) -> dict:
+    """The "I am here / I am away" switch: set by hand, or by the gate itself after a
+    question went unanswered. An expired record is no record — an override always
+    dies by itself, or one forgotten `here` would disable the night policy for good."""
+    try:
+        with open(presence_path(email), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict) or data.get("mode") not in ("here", "away"):
+        return {}
+    until = data.get("until")
+    if until is not None and time.time() >= float(until):
+        return {}
+    return data
+
+
+def presence_write(email: str | None, mode: str | None, until: float | None,
+                   source: str, note: str = "") -> dict:
+    """`mode=None` erases the record and hands the decision back to the automatics."""
+    if mode is None:
+        try:
+            os.remove(presence_path(email))
+        except OSError:
+            pass
+        return {}
+    record = {"mode": mode, "until": int(until) if until else None,
+              "source": source, "note": note, "at": int(time.time())}
+    _atomic_write(presence_path(email), record)
+    return record
+
+
+def _hhmm(value: str) -> int | None:
+    """`"23:00"` -> seconds since local midnight."""
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", (value or "").strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    return hour * 3600 + minute * 60 if hour < 24 and minute < 60 else None
+
+
+def in_unattended_hours(spec, now: float | None = None) -> bool:
+    """`"23:00-08:00"` in LOCAL time. The window normally crosses midnight, so the
+    two sides are compared separately rather than as one interval."""
+    if not isinstance(spec, str) or "-" not in spec:
+        return False
+    start, _, end = spec.partition("-")
+    start_s, end_s = _hhmm(start), _hhmm(end)
+    if start_s is None or end_s is None or start_s == end_s:
+        return False
+    local = time.localtime(now if now is not None else time.time())
+    seconds = local.tm_hour * 3600 + local.tm_min * 60 + local.tm_sec
+    if start_s < end_s:
+        return start_s <= seconds < end_s
+    return seconds >= start_s or seconds < end_s
+
+
+def next_unattended_start(spec, now: float | None = None) -> float | None:
+    """When the unattended window next opens. `None` when there is no window."""
+    if not isinstance(spec, str) or "-" not in spec:
+        return None
+    start_s = _hhmm(spec.partition("-")[0])
+    if start_s is None:
+        return None
+    now = now if now is not None else time.time()
+    local = time.localtime(now)
+    midnight = now - (local.tm_hour * 3600 + local.tm_min * 60 + local.tm_sec)
+    start = midnight + start_s
+    return start if start > now else start + 86400
+
+
+def _presence_detail(record: dict) -> str:
+    until = record.get("until")
+    left = f", {fmt_span(int(float(until) - time.time()))} left" if until else ""
+    note = f" — {record['note']}" if record.get("note") else ""
+    hand = "by hand" if record.get("source") == "manual" else "by the gate itself"
+    return f"set {hand}{note}{left}"
+
+
+def attendance(email: str | None, budget: dict, headless: bool,
+               now: float | None = None) -> dict:
+    """Is there anybody who could answer a question?
+
+    This is not a detail of presentation. A question nobody answers is WORSE than no
+    question: the permission dialog belongs to the CLI, no hook can withdraw it once
+    it is up, and the session stays frozen on it until a key is pressed — hours after
+    the pace line caught up and the question stopped meaning anything.
+
+    The sources are ordered by how much they know, not by how recent they are. A
+    session that cannot show a dialog at all outranks every later statement about
+    presence; a person saying where they are outranks the clock and the guess."""
+    defaults = settings_for(budget, email)
+    if headless:
+        return {"attended": False, "source": "headless",
+                "detail": "the session has no dialog to show"}
+    # One record, and the gate's own conclusion overwrites a hand-set one on purpose:
+    # a claim is what somebody SAID, a measurement is what HAPPENED. Having said "I am
+    # here" and then slept through a question is exactly the case where the claim is
+    # the stale half.
+    record = presence_read(email)
+    if record.get("mode"):
+        return {"attended": record["mode"] == "here",
+                "source": record.get("source", "manual"),
+                "detail": _presence_detail(record)}
+    spec = defaults.get("unattended_hours")
+    if in_unattended_hours(spec, now):
+        return {"attended": False, "source": "hours",
+                "detail": f"local time is inside {spec}"}
+    return {"attended": True, "source": "default", "detail": "an interactive session"}
+
+
+def _ask_answered(email: str | None, budget: dict, commit: bool = True) -> dict | None:
+    """Measure how long the previous question hung, and conclude from it.
+
+    While a permission dialog is up NO hook fires — the session is frozen on it — so
+    the gap between issuing the question and this very call IS the answer latency.
+    A long one means nobody was there, and the gate says so itself instead of waiting
+    to be told: from here on it throttles rather than asks."""
+    path = os.path.join(state_dir(), f"{account_key(email)}.ask.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("pending"):
+        return None
+    latency = time.time() - float(data.get("at") or 0)
+    defaults = settings_for(budget, email)
+    grace = float(defaults.get("away_after_unanswered_minutes", 15)) * 60
+    if commit:
+        _atomic_write(path, {**data, "pending": False, "latency": int(latency)})
+    if latency < grace:
+        return None
+    note = f"a question hung {fmt_span(int(latency))} unanswered"
+    until = time.time() + float(defaults.get("away_auto_hours", 8)) * 3600
+    if commit:
+        return presence_write(email, "away", until, "auto", note)
+    return {"mode": "away", "until": int(until), "source": "auto", "note": note}
 
 
 def _window_phrase(row: dict) -> str:
@@ -1679,18 +1851,24 @@ def _window_phrase(row: dict) -> str:
 
 def _decide(report: dict, budget: dict, headless: bool, strikes: int,
             email: str | None = None, commit: bool = True,
-            event: str | None = None) -> dict:
+            event: str | None = None, attended: bool = True) -> dict:
     """The gate decision in hook-JSON terms. The unknown NEVER blocks.
 
     `event` is the hook event name. It matters because `permissionDecision` is only
     understood by `PreToolUse`; on other events such an answer is invalid and is
-    silently dropped."""
+    silently dropped.
+
+    `attended` says whether anybody could answer a question (see `attendance`). With
+    nobody there the ladder ends in a refusal plus a scheduled wake-up instead of a
+    dialog that would freeze the session until morning."""
     tightest = report.get("tightest")
     if report["verdict"] in ("unknown", "ok") or not tightest:
         return {"action": "allow", "output": {}}
 
     defaults = settings_for(budget, email)
-    mode = "headless" if headless else "interactive"
+    # An unattended session is paced like a headless one: there is nobody to read a
+    # warning or answer a question, so it gets the longer pause instead.
+    mode = "headless" if headless or not attended else "interactive"
     # ALL windows in trouble go out, not just the tightest. Previously one was
     # printed, and the window a person had learned to ignore (a scoped one) covered
     # up the real one.
@@ -1714,13 +1892,28 @@ def _decide(report: dict, budget: dict, headless: bool, strikes: int,
              if row["verdict"] == "exceed" and row.get("wait_seconds") is not None]
     wait = max(waits) if waits else None
     max_wait = _by_key(defaults.get("max_wait_seconds"), mode,
-                       300.0 if headless else 60.0)
+                       300.0 if headless or not attended else 60.0)
     if wait is not None and wait <= max_wait:
         return {"action": "wait", "wait_seconds": wait, "output": {
             "systemMessage": f"⏳ climits — pausing {wait}s while the line catches up"
                              f" ({where})"}}
 
-    if headless:
+    # A longer overrun that the line will still cure is THROTTLED rather than
+    # escalated: sleep the maximum wait, let the call through, and meet the next call
+    # the same way. Spending is pressed back against the line by itself, and neither
+    # a person nor a wake-up is needed. This is the one thing a question cannot do —
+    # the dialog belongs to the CLI, no hook can withdraw it, and the overrun it was
+    # asked about dissolves while the question still hangs there.
+    throttle_max = float(defaults.get("throttle_max_seconds", 1800) or 0)
+    if wait is not None and wait <= throttle_max:
+        return {"action": "throttle", "wait_seconds": int(max_wait), "output": {
+            "systemMessage": f"⏳ climits — throttling: pausing {int(max_wait)}s of the"
+                             f" {fmt_span(int(wait))} the line still needs ({where})"}}
+
+    if headless or not attended:
+        # Reached both by a truly headless run and by an interactive session with
+        # nobody at the keyboard — for the second one this replaces the question that
+        # would otherwise hang until morning.
         # The session is NEVER ended: an overnight run must survive days of refusals
         # and continue once the line grows. Instead of stopping, the refusal is
         # preceded by a growing pause: it damps the retry rate and with it the tokens
@@ -1792,11 +1985,26 @@ def cmd_gate(argv: list[str]) -> int:
         email, payload,
         float(settings_for(budget, email).get("model_seen_ttl_minutes", 60)) * 60)
     report = evaluate(snap, budget, email, headless, models)
-    # strikes only accumulate headless: interactively there is no refusal, there is a
-    # question to the user
-    strikes = _strikes(email, report["verdict"] if headless else "ok", enforce)
+    # Was the PREVIOUS question ever answered? No hook fires while a dialog is up, so
+    # the gap since it was issued is the answer latency. Checked before deciding, so
+    # this very call already acts on what it learned.
+    auto_away = _ask_answered(email, budget, enforce)
+    presence = attendance(email, budget, headless)
+    attended = presence["attended"]
+    # strikes only accumulate where nobody can be asked: with a person at the
+    # keyboard there is no refusal, there is a question
+    strikes = _strikes(email, report["verdict"] if not attended else "ok", enforce)
 
     event = payload.get("hook_event_name")
+    # A typed prompt is the plainest evidence that somebody is back at the keyboard,
+    # so it retires the gate's OWN guess about an absence. A hand-set switch is left
+    # alone — that one was made deliberately, and only `climits presence` undoes it.
+    if event == "UserPromptSubmit" and presence_read(email).get("source") == "auto":
+        if enforce:
+            presence_write(email, None, None, "auto")
+        auto_away = None
+        presence = attendance(email, budget, headless)
+        attended = presence["attended"]
     # `SubagentStop` is the only event that brings a FACT of spend: its payload
     # carries the path to the finished agent's transcript, and the transcript carries
     # the tokens. There is nothing to decide (the agent is already gone), so we only
@@ -1823,7 +2031,8 @@ def cmd_gate(argv: list[str]) -> int:
                                .get("model_seen_ttl_minutes", 60)) * 60)
         decision = {"action": "agent-usage", "output": {}}
     else:
-        decision = _decide(report, budget, headless, strikes, email, enforce, event=event)
+        decision = _decide(report, budget, headless, strikes, email, enforce,
+                           event=event, attended=attended)
 
     # Warnings are muted by a cooldown: on the `*` matcher the gate runs on every
     # tool, and without a lock the "climits ..." line would go out dozens of times a
@@ -1847,6 +2056,11 @@ def cmd_gate(argv: list[str]) -> int:
         "agent_type": payload.get("agent_type"),
         "entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
         "headless": headless,
+        # Who the gate thought was there, and on what grounds: without it a log of
+        # refusals cannot be told apart from a log of unasked questions.
+        "attended": attended,
+        "presence": presence["source"],
+        "auto_away": bool(auto_away),
         "models": models,
         "verdict": report["verdict"],
         "tightest": report.get("tightest"),
@@ -1884,8 +2098,88 @@ def cmd_gate(argv: list[str]) -> int:
     return 0
 
 
+def _parse_span(value: str) -> int | None:
+    """`90m`, `8h`, `45s`, `2d`, or a bare number of seconds."""
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([smhd]?)", (value or "").strip().lower())
+    if not match:
+        return None
+    scale = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    return int(float(match.group(1)) * scale)
+
+
+def cmd_presence(argv: list[str]) -> int:
+    """Say whether anybody is at the keyboard — the one thing the gate cannot know
+    until a question has already gone unanswered, and by then the night is over."""
+    email = account_email()
+    budget = load_budget()
+    opts: dict[str, str] = {}
+    words: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in ("--for", "--until", "--note"):
+            opts[token] = argv[index + 1] if index + 1 < len(argv) else ""
+            index += 2
+            continue
+        words.append(token)
+        index += 1
+
+    action = words[0] if words else None
+    if action not in (None, "here", "away", "auto"):
+        print("usage: climits presence [here|away|auto] [--for 8h] [--until HH:MM]"
+              " [--note text]")
+        return 2
+
+    if action == "auto":
+        presence_write(email, None, None, "manual")
+    elif action in ("here", "away"):
+        if "--until" in opts:
+            target = _hhmm(opts["--until"])
+            if target is None:
+                print(f"--until wants HH:MM, got {opts['--until']!r}")
+                return 2
+            local = time.localtime()
+            midnight = time.time() - (local.tm_hour * 3600 + local.tm_min * 60
+                                      + local.tm_sec)
+            until = midnight + target
+            if until <= time.time():
+                until += 86400
+        elif "--for" in opts:
+            span = _parse_span(opts["--for"])
+            if span is None:
+                print(f"--for wants a span like 90m or 8h, got {opts['--for']!r}")
+                return 2
+            until = time.time() + span
+        else:
+            # Never open-ended: a `here` forgotten in the evening would switch the
+            # night policy off for good, which is exactly the failure it guards.
+            hours = float(settings_for(budget, email)
+                          .get("presence_override_hours", 12))
+            until = time.time() + hours * 3600
+            # And a `here` must not carry into the night unnoticed: by default it
+            # dies when the unattended window opens. Falling asleep is not something
+            # the gate can measure until a question has already frozen the session
+            # for the rest of the night, so the clock has to do it in advance. An
+            # explicit --for / --until overrides this — that one is a decision.
+            if action == "here":
+                opens = next_unattended_start(settings_for(budget, email)
+                                              .get("unattended_hours"))
+                if opens is not None:
+                    until = min(until, opens)
+        presence_write(email, action, until, "manual", opts.get("--note", ""))
+
+    state = attendance(email, budget, _is_headless())
+    print(f"presence: {'somebody can be asked' if state['attended'] else 'nobody to ask'}"
+          f" ({state['source']}: {state['detail']})")
+    print("          over the line the gate " + ("may ask; `climits presence away`"
+          " turns questions into throttling" if state["attended"] else "throttles, then"
+          " declines and reschedules — it never puts up a dialog"))
+    return 0
+
+
 COMMANDS = {"status": cmd_status, "probe": cmd_probe, "feed": cmd_feed,
-            "gate": cmd_gate, "speed": cmd_speed, "agents": cmd_agents}
+            "gate": cmd_gate, "speed": cmd_speed, "agents": cmd_agents,
+            "presence": cmd_presence}
 
 
 def main() -> int:
