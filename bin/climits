@@ -37,7 +37,18 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
+
+# Tools the gate must NEVER hold back, whatever the verdict. Two reasons, and the
+# second one is the expensive one. They spend no quota worth pacing — and, more to
+# the point, `ScheduleWakeup` is how a session OBEYS a refusal. Gating it closed a
+# loop: the refusal said "call ScheduleWakeup and end your turn", the gate then
+# refused that very call with the same words, and the model kept trying. 34 of the
+# first 40 refusals ever issued went to `ScheduleWakeup` — the gate burned the quota
+# it was defending. `TaskStop` and `EndConversation` are the same shape: the ways a
+# session winds itself down must stay open, or a gate can trap a session it cannot
+# then release.
+GATE_EXEMPT_TOOLS = {"ScheduleWakeup", "TaskStop", "EndConversation"}
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 DEFAULTS = {
     # Hooks only observe and log until this is switched on. Off by default on
@@ -1273,7 +1284,8 @@ def cmd_status(argv: list[str]) -> int:
         return 0
 
     with_foreign = any(row.get("foreign_measure") for row in report["windows"])
-    headers = ["", "window", "used", "allowed", "free", "slack", "elapsed", "reset"]
+    headers = ["", "window", "used", "allowed", "start", "free", "slack", "elapsed",
+               "reset"]
     if with_foreign:
         headers.append("others")
     rows, notes = [], []
@@ -1289,6 +1301,7 @@ def cmd_status(argv: list[str]) -> int:
         cells = [
             mark, row["window"],
             f"{row['used_own']:.1f}%", f"{row['allowed_own']:.1f}%",
+            head_start_cell(row),
             f"{head:+.1f} pp" if row["elapsed_pct"] is not None else "—",
             slack_cell(row),
             f"{row['elapsed_pct']:.1f}%" if row["elapsed_pct"] is not None else "—",
@@ -1317,7 +1330,15 @@ def cmd_status(argv: list[str]) -> int:
                          f"across {measure['intervals']} intervals -> reserved for "
                          f"others {row['foreign_reserve_pp']:.1f} pp, cap "
                          f"{row['cap_own']:.1f}%")
-    print_table(headers, rows, aligns="><>>>>>><"[:len(headers)])
+    print_table(headers, rows, aligns="><>>>>>>><"[:len(headers)])
+    # Without this line the two columns that matter are read wrong: "allowed" looks
+    # like a bare share of elapsed time, and "free" like room left in the quota. Both
+    # are about the head start — "free" is the part of it not yet spent, so "+0.0 pp"
+    # means it is gone, not that the quota is out.
+    if any((row.get("burst_pp") or 0) > 0 and row.get("elapsed_pct") is not None
+           for row in report["windows"]):
+        notes.insert(0, 'allowed = elapsed + start; "free" is what is left of the '
+                        'start, and a minus means the spend is past it')
     if notes:
         print()
         for note in notes:
@@ -1829,6 +1850,33 @@ def _ask_answered(email: str | None, budget: dict, commit: bool = True) -> dict 
     return {"mode": "away", "until": int(until), "source": "auto", "note": note}
 
 
+def head_start_cell(row: dict) -> str:
+    """The head start in points AND in time. Points alone do not carry between
+    windows — 9.5 pp is 16 hours on the weekly window and 28 minutes on the
+    five-hour one, and it is the hours that a person reasons in."""
+    burst = row.get("burst_pp") or 0.0
+    if row.get("elapsed_pct") is None or burst <= 0:
+        return "—"
+    total = WINDOW_SECONDS.get(row["window"], DEFAULT_WINDOW_SECONDS)
+    return f"+{burst:.1f} pp ({fmt_span(int(burst / 100.0 * total))})"
+
+
+def head_start_split(row: dict) -> str:
+    """"allowed" spelled out as "time that has passed + head start", when that is
+    exactly what it is. Without it the figure is unreadable in the one case that
+    matters: a spend that has eaten the whole head start and gone 0.3 pp past it
+    prints as "over by 0.3 pp", indistinguishable from a spend that overshot a
+    still-untouched head start by the same 0.3. Returns "" when the sum does not
+    hold — a reduced pace bends the line, and the cap can bound the allowance below
+    it, and a decomposition that does not add up is worse than none."""
+    elapsed, burst = row.get("elapsed_pct"), row.get("burst_pp") or 0.0
+    if elapsed is None or burst <= 0:
+        return ""
+    if abs(row["allowed_own"] - (elapsed + burst)) > 0.05:
+        return ""
+    return f"{elapsed:.0f}% elapsed + {burst:.1f} pp head start"
+
+
 def _window_phrase(row: dict) -> str:
     """One window in plain words. The gap to the line ("2 pp to spare") matters more
     than the used/allowed pair it would otherwise have to be derived from, and in
@@ -1844,8 +1892,10 @@ def _window_phrase(row: dict) -> str:
         catch_up = row.get("wait_seconds")
         gap = (f", over by {-head:.1f} pp"
                + (f", the norm catches up in {fmt_span(catch_up)}" if catch_up else ""))
+    split = head_start_split(row)
     return (f"{row['window']}: used {row['used_own']:.0f}%, "
-            f"allowed by this minute {row['allowed_own']:.0f}%" + gap
+            f"allowed by this minute {row['allowed_own']:.0f}%"
+            + (f" = {split}" if split else "") + gap
             + f", reset in {humanize(row['seconds_left'])}")
 
 
@@ -1991,11 +2041,20 @@ def cmd_gate(argv: list[str]) -> int:
     auto_away = _ask_answered(email, budget, enforce)
     presence = attendance(email, budget, headless)
     attended = presence["attended"]
+    # Read WHAT is being gated before deciding anything: an exempt tool must not even
+    # accrue a strike, or obeying the gate would lengthen the next backoff.
+    event = payload.get("hook_event_name")
+    tool = payload.get("tool_name")
+    exempt = bool(tool) and tool in GATE_EXEMPT_TOOLS
     # strikes only accumulate where nobody can be asked: with a person at the
     # keyboard there is no refusal, there is a question
-    strikes = _strikes(email, report["verdict"] if not attended else "ok", enforce)
+    # An exempt call does not touch the counter AT ALL — not even to reset it. The
+    # value is unused on that path, and `_strikes` with a non-"exceed" verdict zeroes
+    # the file: obeying a refusal would then hand the next refusal a fresh 30-second
+    # backoff instead of the grown one.
+    strikes = 0 if exempt else _strikes(
+        email, report["verdict"] if not attended else "ok", enforce)
 
-    event = payload.get("hook_event_name")
     # A typed prompt is the plainest evidence that somebody is back at the keyboard,
     # so it retires the gate's OWN guess about an absence. A hand-set switch is left
     # alone — that one was made deliberately, and only `climits presence` undoes it.
@@ -2010,7 +2069,11 @@ def cmd_gate(argv: list[str]) -> int:
     # the tokens. There is nothing to decide (the agent is already gone), so we only
     # count and record.
     agent_tokens = None
-    if event == "SubagentStop":
+    if exempt:
+        # Logged like any other call — a log of refusals is only readable next to the
+        # calls that were let through on purpose.
+        decision = {"action": "exempt", "output": {}}
+    elif event == "SubagentStop":
         agent_tokens = agent_usage_from_transcript(payload.get("agent_transcript_path") or "")
         if agent_tokens and enforce:
             agents_append(email, {
@@ -2048,7 +2111,8 @@ def cmd_gate(argv: list[str]) -> int:
         "t": int(time.time()),
         "account": email,
         "event": event,
-        "tool": payload.get("tool_name"),
+        "tool": tool,
+        "exempt": exempt,
         "session": payload.get("session_id"),
         # Tell the main loop from subagents ONLY by these fields: `session_id` for a
         # call made inside a subagent is the same as the main loop's.

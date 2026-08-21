@@ -13,12 +13,19 @@ snapshot       api (fresh)
 plan           max (default_claude_max_5x)
 mode           interactive
 
-  window      used  allowed      free    slack  elapsed   reset
-  five_hour  21.0%    57.3%  +36.3 pp  +1h 49m    47.3%  2h 38m
-  seven_day   3.0%    33.0%  +30.0 pp   +2d 2h    23.4%   5d 8h
+  window      used  allowed             start      free    slack  elapsed   reset
+  five_hour  21.0%    57.3%    +10.0 pp (30m)  +36.3 pp  +1h 49m    47.3%  2h 38m
+  seven_day   3.0%    33.0%  +9.5 pp (16h 0m)  +30.0 pp   +2d 2h    23.4%   5d 8h
+
+  allowed = elapsed + start; "free" is what is left of the start, and a minus means the spend is past it
 
 verdict:  within the pace line
 ```
+
+`allowed` is not a bare share of elapsed time: it is that share **plus the head
+start** (`burst_minutes`), and `free` is the part of the head start still unspent.
+The distinction is the whole reading of the table — `free +0.0 pp` means the head
+start is exactly used up, not that the quota is out.
 
 ## What problem this solves
 
@@ -39,6 +46,12 @@ allowed to have spent **by this minute**", and it hangs on hooks, where it can a
 | `exceed`, longer, still curable | the hook **throttles**: it sleeps its maximum, lets the call through, and meets the next one the same way, pressing the spend back against the line |
 | `exceed`, beyond that, somebody at the keyboard | you are **asked** once (not per tool call): continue anyway or wait |
 | `exceed`, beyond that, nobody there | the call is **declined** with a growing backoff, and the agent is told to call `ScheduleWakeup` and end the turn — the session is never killed |
+
+Whatever the verdict, the gate never holds back the tools a session **obeys** it
+with — `ScheduleWakeup`, `TaskStop`, `EndConversation`. They spend no quota worth
+pacing, and blocking the first of them closes a loop: the refusal asks for a
+wake-up, the wake-up is refused with the same words, and the retries burn the quota
+the gate is defending.
 
 The last two rows are the reason this exists: an overnight autonomous run that hits
 a limit at 3am should pause and resume, not die — and it must not stop to ask a
@@ -246,7 +259,7 @@ list of what remains unfinished.
 python3 tests/selftest.py
 ```
 
-94 checks, no network and no live account: the state directory is replaced with a
+117 checks, no network and no live account: the state directory is replaced with a
 temporary one, the account comes from an environment variable, and snapshots,
 history and transcripts are built by hand. Anything that changes the line, the gate
 policy, the access states or the shared-account layer should show up here.

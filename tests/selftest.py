@@ -140,6 +140,19 @@ def run_gate(climits, payload: dict) -> tuple[dict, dict]:
     return json.loads(buffer.getvalue() or "{}"), record
 
 
+def blocked_strikes_after(climits) -> int:
+    """The strike counter as it stands, read without touching it. A gate-exempt call
+    must leave it where the refusal put it: strikes drive the backoff, so counting
+    an obedient call would punish obedience."""
+    path = os.path.join(os.environ["CLIMITS_STATE_DIR"],
+                        f"{climits.account_key('test')}.strikes.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return int(json.load(fh).get("count", 0))
+    except (OSError, ValueError):
+        return 0
+
+
 def row_for(climits, snap: dict, cfg: dict, headless: bool = False) -> dict:
     report = climits.evaluate(snap, cfg, "test", headless)
     return next(r for r in report["windows"] if r["window"] == WINDOW)
@@ -817,6 +830,46 @@ def main() -> int:
               str(opens))
         check(climits.next_unattended_start(None) is None,
               "with no night window there is nothing to cap a `here` against")
+
+        print("25. The tools a session obeys the gate WITH are never gated")
+        # The regression this guards, seen in the wild: a refusal said "call
+        # ScheduleWakeup and end your turn", the gate then refused ScheduleWakeup
+        # itself with the same words, and the model kept trying — 34 of the first 40
+        # refusals ever issued went to that one tool. A gate that blocks the way of
+        # obeying it burns the very quota it is defending.
+        # `state` was rebound to an attendance dict above; take the path from the env
+        # instead, where it has been since the fixture was created.
+        state_dir = os.environ["CLIMITS_STATE_DIR"]
+        os.environ["CLAUDE_CONFIG_DIR"] = state_dir
+        write_budget(state_dir, {"enforce": True, "unattended_hours": "00:00-23:59",
+                             "pace_factor": {"interactive": 1.0, "headless": 1.0},
+                             "burst_minutes": {"five_hour": 10, "seven_day": 120},
+                             "throttle_max_seconds": 1, "max_wait_seconds":
+                             {"interactive": 0, "headless": 0}})
+        climits._atomic_write(climits.snapshot_path("test"), snapshot(now, 99.0, left))
+        blocked_out, blocked = run_gate(climits, {"hook_event_name": "PreToolUse",
+                                                  "tool_name": "Bash",
+                                                  "session_id": "s9"})
+        check(blocked["action"] == "deny"
+              and "ScheduleWakeup" in json.dumps(blocked_out),
+              "the fixture does refuse an ordinary tool and asks for a wake-up",
+              blocked["action"])
+        for name in sorted(climits.GATE_EXEMPT_TOOLS):
+            out, record = run_gate(climits, {"hook_event_name": "PreToolUse",
+                                             "tool_name": name, "session_id": "s9"})
+            check(out == {} and record["action"] == "exempt" and record["exempt"],
+                  f"{name} goes through the same refusal untouched",
+                  f"{record['action']} / {json.dumps(out)}")
+        # Strikes drive the backoff before a repeated refusal. An obedient call must
+        # neither raise the counter (punishing obedience) nor zero it (handing the
+        # next refusal a fresh, short backoff) — it must not touch it at all.
+        kept = blocked_strikes_after(climits)
+        for _ in range(3):
+            run_gate(climits, {"hook_event_name": "PreToolUse",
+                               "tool_name": "ScheduleWakeup", "session_id": "s9"})
+        check(kept >= 1 and blocked_strikes_after(climits) == kept,
+              "obeying the gate leaves the backoff counter exactly where it was",
+              f"{kept} -> {blocked_strikes_after(climits)}")
     finally:
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
         shutil.rmtree(state, ignore_errors=True)

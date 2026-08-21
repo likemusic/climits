@@ -10,7 +10,7 @@
       "displayName": "climits",
       "description": "Paces your Claude Code subscription usage: hooks that warn, pause or decline before the quota runs out.",
       "source": "./",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "license": "MIT",
       "keywords": [
         "usage",
