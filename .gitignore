@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# Personal notes about this plugin that are not for publication: distribution
+# tactics, who to approach and when, submission statuses.
+CLAUDE.local.md
